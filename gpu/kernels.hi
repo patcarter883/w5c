@@ -41,6 +41,22 @@ struct dtab_t {                 /* decoder: adds the 4 KB slot lookup */
    made the very first encode in a process use garbage tables. */
 
 /* --------------------------------------------------------------- transform */
+typedef short v2s __attribute__((ext_vector_type(2)));
+
+/* Two int16 coefficients per 32-bit register: v_pk_add_u16 / v_pk_ashrrev_i16 are single
+   instructions on gfx1201, so a contiguous pair costs one load and one shift instead of two. */
+__device__ __forceinline__ v2s v2abs(v2s v)
+{
+    /* per-lane, not a vector literal: (v2s)(a, b) does not build the vector it looks like it
+       should, and the mistake was invisible in desymbolise because reconstructed magnitudes are
+       never negative there. */
+    v2s r;
+    int a = v[0], b = v[1];
+    r[0] = (short)(a < 0 ? -a : a);
+    r[1] = (short)(b < 0 ? -b : b);
+    return r;
+}
+
 __device__ __forceinline__ int mir(int i, int n)
 {
     while (i < 0 || i >= n) {
@@ -74,31 +90,31 @@ __device__ __forceinline__ int mir(int i, int n)
 /* The reference writes each detail into the int16 line and reads it back, so a value that
    overflows int16 is truncated at that point. Recomputing it must truncate identically, or the
    update phase sees a different number than the stored one. */
-__device__ __forceinline__ int det_at(const int16_t *s, long stride, int j, int nev)
+__device__ __forceinline__ int det_at(const int16_t *s, int stride, int j, int nev)
 {
-    int a = s[(long)2 * mir(j, nev) * stride];
-    int b = s[(long)2 * mir(j + 1, nev) * stride];
-    return (int16_t)(s[(long)(2 * j + 1) * stride] - ((a + b) >> 1));
+    int a = s[2 * mir(j, nev) * stride];
+    int b = s[2 * mir(j + 1, nev) * stride];
+    return (int16_t)(s[(2 * j + 1) * stride] - ((a + b) >> 1));
 }
 
-__device__ __forceinline__ int ev_at(const int16_t *s, long stride, int j, int nev, int nod)
+__device__ __forceinline__ int ev_at(const int16_t *s, int stride, int j, int nev, int nod)
 {
-    int dm = s[(long)(nev + mir(j - 1, nod)) * stride];
-    int dp = s[(long)(nev + mir(j, nod)) * stride];
-    return (int16_t)(s[(long)j * stride] - ((dm + dp + 2) >> 2));
+    int dm = s[(nev + mir(j - 1, nod)) * stride];
+    int dp = s[(nev + mir(j, nod)) * stride];
+    return (int16_t)(s[j * stride] - ((dm + dp + 2) >> 2));
 }
 
 /* Lossy mode costs nothing in the container: truncating low bitplanes before symbolisation
    means the decoder reconstructs exactly what was coded, so no quantiser side information is
    needed. The bitplane count follows automatically because k_block_mb measures the truncated
    coefficients. */
-__global__ void k_quant_rect(int16_t * __restrict__ buf, long pitch,
+__global__ void k_quant_rect(int16_t * __restrict__ buf, int pitch,
                              int x0, int y0, int w, int h, int shift)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    int16_t *p = &buf[(long)(y0 + y) * pitch + x0 + x];
+    int16_t *p = &buf[(y0 + y) * pitch + x0 + x];
     int v = *p;
     *p = (int16_t)((v >> shift) << shift);
 }
@@ -110,7 +126,7 @@ __global__ void k_quant_rect(int16_t * __restrict__ buf, long pitch,
 struct spr { int y0[W5C_MAXSLICE]; int nl[W5C_MAXSLICE]; int n[W5C_MAXSLICE]; };
 
 __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
-                                long y0_step, long line_pitch, long stride,
+                                int y0_step, int line_pitch, int stride,
                                 int posmajor, spr sp, int ns, int wav)
 {
     int sl = blockIdx.y;
@@ -123,9 +139,9 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
     if (line >= nlines || k >= n) return;
 
     int nev = (n + 1) / 2, nod = n / 2;
-    long org = (long)sp.y0[sl] * y0_step;
-    const int16_t *s = src + org + (long)line * line_pitch;
-    int16_t *d = dst + org + (long)line * line_pitch;
+    int org = sp.y0[sl] * y0_step;
+    const int16_t *s = src + org + line * line_pitch;
+    int16_t *d = dst + org + line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (wav) {
@@ -133,25 +149,25 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
            no vertical support beyond one line - that is the property that would make a slice
            restart nearly free. */
         int a = 0, b = 0, dd = 0;
-        if (k < nod) { a = s[(long)2 * k * stride]; b = s[(long)(2 * k + 1) * stride]; dd = b - a;
-                       d[(long)(nev + k) * stride] = (int16_t)dd; }
+        if (k < nod) { a = s[2 * k * stride]; b = s[(2 * k + 1) * stride]; dd = b - a;
+                       d[(nev + k) * stride] = (int16_t)dd; }
         if (k < nev) {
-            int ev = s[(long)2 * k * stride];
-            d[(long)k * stride] = (int16_t)(ev + (dd >> 1));
+            int ev = s[2 * k * stride];
+            d[k * stride] = (int16_t)(ev + (dd >> 1));
         }
     } else {
         if (k < nod)
-            d[(long)(nev + k) * stride] = (int16_t)det_at(s, stride, k, nev);
+            d[(nev + k) * stride] = (int16_t)det_at(s, stride, k, nev);
         if (k < nev) {
             int dm = det_at(s, stride, mir(k - 1, nod), nev);
             int dp = det_at(s, stride, mir(k, nod), nev);
-            d[(long)k * stride] = (int16_t)(s[(long)2 * k * stride] + ((dm + dp + 2) >> 2));
+            d[k * stride] = (int16_t)(s[2 * k * stride] + ((dm + dp + 2) >> 2));
         }
     }
 }
 
 __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
-                                long y0_step, long line_pitch, long stride,
+                                int y0_step, int line_pitch, int stride,
                                 int posmajor, spr sp, int ns, int wav)
 {
     int sl = blockIdx.y;
@@ -164,27 +180,27 @@ __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __re
     if (line >= nlines || k >= n) return;
 
     int nev = (n + 1) / 2, nod = n / 2;
-    long org = (long)sp.y0[sl] * y0_step;
-    const int16_t *s = src + org + (long)line * line_pitch;
-    int16_t *d = dst + org + (long)line * line_pitch;
+    int org = sp.y0[sl] * y0_step;
+    const int16_t *s = src + org + line * line_pitch;
+    int16_t *d = dst + org + line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (wav) {
         if (k < nod) {
-            int dd = s[(long)(nev + k) * stride];
-            int ev = s[(long)k * stride] - (dd >> 1);
-            d[(long)2 * k * stride] = (int16_t)ev;
-            d[(long)(2 * k + 1) * stride] = (int16_t)(dd + ev);
+            int dd = s[(nev + k) * stride];
+            int ev = s[k * stride] - (dd >> 1);
+            d[2 * k * stride] = (int16_t)ev;
+            d[(2 * k + 1) * stride] = (int16_t)(dd + ev);
         } else if (k < nev) {
-            d[(long)2 * k * stride] = s[(long)k * stride];
+            d[2 * k * stride] = s[k * stride];
         }
     } else {
         if (k < nev)
-            d[(long)2 * k * stride] = (int16_t)ev_at(s, stride, k, nev, nod);
+            d[2 * k * stride] = (int16_t)ev_at(s, stride, k, nev, nod);
         if (k < nod) {
             int a = ev_at(s, stride, mir(k, nev), nev, nod);
             int b = ev_at(s, stride, mir(k + 1, nev), nev, nod);
-            d[(long)(2 * k + 1) * stride] = (int16_t)(s[(long)(nev + k) * stride] + ((a + b) >> 1));
+            d[(2 * k + 1) * stride] = (int16_t)(s[(nev + k) * stride] + ((a + b) >> 1));
         }
     }
 }
@@ -374,7 +390,7 @@ struct sdesc {
 
 __device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x0, int cx, int cy)
 {
-    return plane[(size_t)(y0 + cy) * w + x0 + cx];
+    return plane[(y0 + cy) * w + x0 + cx];
 }
 
 __global__ void k_sym(const sdesc * __restrict__ d,
@@ -390,7 +406,7 @@ __global__ void k_sym(const sdesc * __restrict__ d,
     sdesc sd = d[s];
     int bw = sd.bw, bh = sd.bh, n = bw * bh, ctx = sd.ctx, pw = sd.pw;
     uint8_t *ob = emit ? out + boff[s] : nullptr;
-    const int16_t *base = sd.pl + (size_t)sd.y0 * pw + sd.x0;
+    const int16_t *base = sd.pl + sd.y0 * pw + sd.x0;
     uint32_t nb = 0;
     int newly = 0;
 
@@ -399,24 +415,19 @@ __global__ void k_sym(const sdesc * __restrict__ d,
     for (int p = sd.mb - 1; p >= 0; p--) {
         int i = 0;
         for (int y = 0; y < bh; y++) {
-            const int16_t *row = base + (size_t)y * pw;
+            const int16_t *row = base + y * pw;
             for (int x = 0; x < bw; x++, i++) {
                 if ((i & 31) == 0) {
-                    if (nw) {
-                        /* shared per (block, plane) mask instead of a per-context rescan */
-                        newly = (int)((nw[sd.bi * 16 + p] >> (i >> 5)) & 1u);
-                    } else {
-                    /* does any coefficient of this group become significant at p? */
-                    newly = 0;
-                    const int16_t *sr = row;
-                    int sx = x;
-                    int rem = n - i; if (rem > 32) rem = 32;
-                    for (int k = 0; k < rem; k++) {
-                        int v = sr[sx];
-                        int m = v < 0 ? -v : v;
-                        if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
-                        if (++sx == bw) { sx = 0; sr += pw; }
-                    }
+                    if (nw) newly = (int)((nw[sd.bi * 16 + p] >> (i >> 5)) & 1u);
+                    else {
+                        newly = 0;
+                        const int16_t *sr = row; int sx = x;
+                        int rem = n - i; if (rem > 32) rem = 32;
+                        for (int k2 = 0; k2 < rem; k2++) {
+                            int v2 = sr[sx]; int m2 = v2 < 0 ? -v2 : v2;
+                            if (!(m2 >> (p + 1)) && ((m2 >> p) & 1)) { newly = 1; break; }
+                            if (++sx == bw) { sx = 0; sr += pw; }
+                        }
                     }
                     if (ctx == 0) {
                         if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
@@ -424,7 +435,6 @@ __global__ void k_sym(const sdesc * __restrict__ d,
                     }
                 }
                 if (ctx == 0) continue;
-
                 int v = row[x];
                 int m = v < 0 ? -v : v;
                 if (m >> (p + 1)) {
@@ -474,7 +484,7 @@ __global__ void k_pack(const uint8_t * __restrict__ bits,
     for (uint32_t k = 0; k < ns; k++) {
         unsigned v = 0;
         for (int j = 0; j < SYMBITS; j++) {
-            size_t bit = (size_t)k * SYMBITS + j;
+            uint32_t bit = k * SYMBITS + (uint32_t)j;
             if (bit < nbits[s] && ((b[bit >> 3] >> (bit & 7)) & 1)) v |= 1u << j;
         }
         o[k] = (uint8_t)v;
@@ -496,7 +506,7 @@ __global__ void k_hist(const uint8_t * __restrict__ syms,
     const uint8_t *p = syms + soff[s];
     uint32_t n = nsym[s];
     for (uint32_t i = 0; i < n; i++) local[p[i]]++;
-    int *h = hist + (size_t)stab[s] * NSYM;
+    int *h = hist + (int)stab[s] * NSYM;
     for (int k = 0; k < NSYM; k++) if (local[k]) atomicAdd(h + k, local[k]);
 }
 
@@ -583,7 +593,7 @@ __global__ void k_block_mb(bdesc * __restrict__ bd, int nblocks)
     bdesc d = bd[b];
     int mx = 0;
     for (int y = 0; y < d.bh; y++) {
-        const int16_t *row = d.pl + (size_t)(d.y0 + y) * d.pw + d.x0;
+        const int16_t *row = d.pl + (d.y0 + y) * d.pw + d.x0;
         for (int x = 0; x < d.bw; x++) {
             int v = row[x]; v = v < 0 ? -v : v;
             if (v > mx) mx = v;
@@ -605,7 +615,7 @@ __global__ void k_newly(const bdesc * __restrict__ bd, int nblocks, uint32_t * _
     if (p >= d.mb) { nw[b * 16 + p] = 0; return; }
 
     int bw = d.bw, bh = d.bh, pw = d.pw;
-    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
+    int16_t *base = d.pl + d.y0 * pw + d.x0;
     uint32_t mask = 0;
     int i = 0;
     for (int y = 0; y < bh; y++) {
@@ -648,7 +658,7 @@ __global__ void k_desym_w(const uint8_t * __restrict__ bits,
     bdesc d = bd[w];
     int bw = d.bw, bh = d.bh, n = bw * bh, pw = d.pw;
     int ng = (n + 31) / 32;
-    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
+    int16_t *base = d.pl + d.y0 * pw + d.x0;
 
     const uint8_t *stg = bits + boff[w * 4 + 0];
     const uint8_t *sts = bits + boff[w * 4 + 1];
@@ -672,7 +682,19 @@ __global__ void k_desym_w(const uint8_t * __restrict__ bits,
         /* classify my group: already significant, or newly significant at this plane */
         uint32_t amask = 0, qmask = 0;
         int csig = 0, cref = 0;
-        {
+        if (cx == 0 && cnt == bw && (bw & 1) == 0) {
+            /* whole rows, contiguous: two coefficients per load, arithmetic packed */
+            int16_t *rp = base + (size_t)cy * pw;
+            for (int k = 0; k < cnt; k += 2) {
+                v2s v = *(const v2s *)&rp[k];
+                v2s m = v2abs(v);
+                int m0 = m[0], m1 = m[1];
+                if (m0 >> (p + 1)) { amask |= 1u << k; cref++; }
+                else if (newly) { qmask |= 1u << k; csig++; }
+                if (m1 >> (p + 1)) { amask |= 1u << (k + 1); cref++; }
+                else if (newly) { qmask |= 1u << (k + 1); csig++; }
+            }
+        } else {
             int16_t *rp = base + (size_t)cy * pw;
             int tx = cx;
             for (int k = 0; k < cnt; k++) {
@@ -749,7 +771,7 @@ __global__ void k_desym(const uint8_t * __restrict__ bits,
 
     bdesc d = bd[b];
     int bw = d.bw, bh = d.bh, n = bw * bh, pw = d.pw;
-    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
+    int16_t *base = d.pl + d.y0 * pw + d.x0;
     const uint8_t *st[4];
     size_t pos[4] = {0, 0, 0, 0};
     for (int c = 0; c < 4; c++) st[c] = bits + boff[b * 4 + c];
@@ -761,7 +783,7 @@ __global__ void k_desym(const uint8_t * __restrict__ bits,
     for (int p = d.mb - 1; p >= 0; p--) {
         int i = 0, newly = 0;
         for (int y = 0; y < bh; y++) {
-            int16_t *row = base + (size_t)y * pw;
+            int16_t *row = base + y * pw;
             for (int x = 0; x < bw; x++, i++) {
                 if ((i & 31) == 0) {
                     newly = (st[0][pos[0] >> 3] >> (pos[0] & 7)) & 1;
