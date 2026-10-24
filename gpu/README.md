@@ -44,6 +44,31 @@ matter here (the transform is ~0.03% of the codec budget) but it is why this is 
 Floor is ~0.4 ms across all sizes: 10 kernel launches of overhead. Irrelevant at HD/4K,
 dominant below ~320×240.
 
+## GPU symbolisation
+
+`sym_gpu` ports the bitplane walk to the device and validates it against the reference
+symboliser on identical coefficients: **symbols identical, 0/8428 streams differ.**
+
+The trick that makes it tractable: **it needs no per-coefficient state.** A coefficient is
+significant at plane `p` iff `|c| >= 2^p`, and it becomes significant at `p` iff `|c| >> p == 1`.
+So the walk is a pure function of the coefficients, and the four contexts are four independent
+serial runs rather than one serial walk.
+
+| frame | streams | host symbolise | GPU symbolise | speedup |
+|---|---|---|---|---|
+| 1080p | 2308 | 181 ms | 24.5 ms | 7.4× |
+| 4K | 8428 | 715 ms | 41.4 ms | 17.3× |
+
+**It is occupancy-limited, not compute-limited.** Per-stream cost falls from 10.6 µs to 4.9 µs
+as the stream count rises 3.65× — the 1080p case starves the machine (2308 work-items on 8192
+lanes = one wave deep). Even 4K only just fills one wave.
+
+That points at the next lever precisely: planes are independent too (the statelessness means
+only the output bit offset links them), so splitting each stream over its bitplanes would give
+`mb`× more work items and much shorter serial runs. That change needs per-plane bit offsets
+within a stream, which means either byte-aligned per-plane runs (up to 7 wasted bits each,
+and the packer must skip the padding) or cross-plane read-modify-write. Not yet done.
+
 ## End-to-end driver
 
 `codec_gpu` chains the whole codec and validates every stage against the reference:

@@ -2,7 +2,7 @@ HIP ?= hipcc
 ARCH ?= gfx1201
 REF  := ../ref
 
-BINS := rans_gpu rans_dec dwt_gpu codec_gpu
+BINS := rans_gpu rans_dec dwt_gpu sym_gpu codec_gpu
 
 all: $(BINS)
 
@@ -15,6 +15,12 @@ rans_dec: rans_dec.hip kernels.hi
 
 dwt_gpu.o: dwt_gpu.hip kernels.hi $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
+
+sym_gpu.o: sym_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
+	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
+
+sym_gpu: sym_gpu.o codec_ref.o wavelet_ref.o
+	$(HIP) -o $@ $^
 
 codec_gpu.o: codec_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<

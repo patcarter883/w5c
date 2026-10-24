@@ -1,4 +1,6 @@
 rans_gpu
 rans_dec
 dwt_gpu
+sym_gpu
+codec_gpu
 *.o
