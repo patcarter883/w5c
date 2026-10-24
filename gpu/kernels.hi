@@ -458,4 +458,92 @@ __global__ void k_norm(const int * __restrict__ hist, const int * __restrict__ p
     for (int k = 0; k < NSYM; k++) out[k] = (uint16_t)f[k];
 }
 
+/* ----------------------------------------------------- bitplane desymbolise */
+/* symbols -> packed bits, per stream */
+__global__ void k_unpack(const uint8_t * __restrict__ syms,
+                         const uint32_t * __restrict__ soff,
+                         const uint32_t * __restrict__ nsym,
+                         uint8_t * __restrict__ bits,
+                         const uint32_t * __restrict__ boff,
+                         int nstreams)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nstreams) return;
+    const uint8_t *in = syms + soff[s];
+    uint32_t ns = nsym[s];
+    uint8_t *o = bits + boff[s];
+    size_t nbytes = ((size_t)ns * SYMBITS + 7) / 8;
+    for (size_t i = 0; i < nbytes; i++) o[i] = 0;
+    for (uint32_t k = 0; k < ns; k++)
+        for (int j = 0; j < SYMBITS; j++)
+            if ((in[k] >> j) & 1) {
+                size_t b = (size_t)k * SYMBITS + j;
+                o[b >> 3] |= (uint8_t)(1u << (b & 7));
+            }
+}
+
+struct bdesc { int x0, y0, bw, bh, mb; };
+
+/* One thread per code-block: the walk interleaves the four contexts, so it cannot be split
+   per context. Magnitude is accumulated straight into the destination plane and the sign is
+   held in a small bitmap, which avoids a per-coefficient state array. */
+__global__ void k_desym(const uint8_t * __restrict__ bits,
+                        const uint32_t * __restrict__ boff,
+                        const bdesc * __restrict__ bd,
+                        int16_t * __restrict__ plane, int w,
+                        int nblocks)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+
+    bdesc d = bd[b];
+    int bw = d.bw, bh = d.bh, n = bw * bh;
+    int16_t *base = plane + (size_t)d.y0 * w + d.x0;
+    const uint8_t *st[4];
+    size_t pos[4] = {0, 0, 0, 0};
+    for (int c = 0; c < 4; c++) st[c] = bits + boff[b * 4 + c];
+
+    uint32_t sgn[(64 * 64) / 32];
+    for (int i = 0; i < n / 32; i++) sgn[i] = 0;
+
+    /* zero the block */
+    for (int y = 0; y < bh; y++)
+        for (int x = 0; x < bw; x++) base[(size_t)y * w + x] = 0;
+
+    for (int p = d.mb - 1; p >= 0; p--) {
+        int gx = 0, gy = 0;
+        for (int g0 = 0; g0 < n; g0 += 32) {
+            int g1 = g0 + 32 < n ? g0 + 32 : n;
+            int newly = (st[0][pos[0] >> 3] >> (pos[0] & 7)) & 1;
+            pos[0]++;
+
+            int cx = gx, cy = gy;
+            for (int i = g0; i < g1; i++) {
+                int16_t *q = &base[(size_t)cy * w + cx];
+                int m = *q;
+                if (m >> (p + 1)) {
+                    int bit = (st[3][pos[3] >> 3] >> (pos[3] & 7)) & 1;
+                    pos[3]++;
+                    if (bit) *q = (int16_t)(m | (1 << p));
+                } else if (newly) {
+                    int sbit = (st[1][pos[1] >> 3] >> (pos[1] & 7)) & 1;
+                    pos[1]++;
+                    if (sbit) {
+                        int sg = (st[2][pos[2] >> 3] >> (pos[2] & 7)) & 1;
+                        pos[2]++;
+                        *q = (int16_t)(1 << p);
+                        if (sg) sgn[i >> 5] |= 1u << (i & 31);
+                    }
+                }
+                if (++cx == bw) { cx = 0; cy++; }
+            }
+            gx = cx; gy = cy;
+        }
+    }
+    /* apply signs */
+    for (int y = 0, i = 0; y < bh; y++)
+        for (int x = 0; x < bw; x++, i++)
+            if ((sgn[i >> 5] >> (i & 31)) & 1) base[(size_t)y * w + x] = (int16_t)(-base[(size_t)y * w + x]);
+}
+
 #endif

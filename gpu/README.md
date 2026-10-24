@@ -112,6 +112,31 @@ are independent too (only the output bit offset links them), so splitting each s
 bitplanes would multiply the work items by `mb` and shorten the serial runs. That is the
 measured occupancy fix; at 1080p60 the target is ≤16.7 ms and 32 ms is ~1.9× short.
 
+### The decoder is on the device too
+
+`k_unpack` (symbols -> bits) and `k_desym` (bits -> coefficients) close the decode path. The
+walk interleaves all four contexts, so it cannot be split per context: one thread owns a whole
+code-block. Magnitude is accumulated straight into the destination plane and the sign is held
+in a 128-word bitmap, which avoids a per-coefficient state array — the same statelessness that
+made the encoder tractable.
+
+Verified: **coefficients identical to the reference decode** (0/2073600 at 1080p,
+0/8294400 at 4K), then round-trip pixels bit-exact with **no host codec stage at all**.
+
+| frame | fwd | sym+emit | pack | hist+norm | enc | dec | desym | inv | total | fps |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1080p synth | 1.7 | 9.5 | 1.2 | 0.8 | 0.7 | 0.7 | 15.7 | 0.2 | **30.4 ms** | 32.9 |
+| 1080p real | 1.5 | 12.5 | 1.2 | 0.8 | 0.8 | 0.9 | 18.0 | 0.2 | **35.8 ms** | 27.9 |
+| 4K synth | 2.1 | 14.7 | 2.3 | 1.7 | 1.7 | 1.6 | 19.4 | 0.6 | **43.9 ms** | 22.8 |
+
+Both directions now run entirely on the GPU; the host only orchestrates and copies buffers.
+
+**Desymbolise is now the largest single stage** (15.7–19.4 ms) because it is one thread per
+code-block — 609 work-items at 1080p, which is even more starved than the symboliser was. Note
+it was 30.1 ms until I replaced the per-coefficient `i / bw` / `i % bw` with an incrementing
+cursor: an integer division in that inner loop cost 2x. The remaining parallelism is genuinely
+harder here, because the walk is sequential within a block by construction.
+
 ## Entropy decode
 
 ```

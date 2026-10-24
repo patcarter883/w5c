@@ -343,15 +343,54 @@ int main(int argc, char **argv)
            baddec ? "MISMATCH" : "symbol streams identical to reference", baddec, dmp.ns);
     if (baddec) return 1;
 
-    /* ---- 5. reference decode -> GPU inverse transform -> pixels ---- */
+    /* ---- 5. reference decode (oracle only) ---- */
     std::vector<int16_t> coef2(npx);
     t0 = now_s();
     if (codec_decode(container.buf, container.len, coef2.data(), w, h, levels, 2, NULL)) { printf("FAIL: reference decode\n"); return 1; }
     double ms_rd = (now_s() - t0) * 1e3;
-    if (memcmp(coef2.data(), coef.data(), npx * 2)) { printf("FAIL: decoded coefficients differ\n"); return 1; }
+    if (memcmp(coef2.data(), coef.data(), npx * 2)) { printf("FAIL: reference decode differs from fwd coefficients\n"); return 1; }
 
-    HIPCHECK(hipMemcpy(d, coef2.data(), npx * 2, hipMemcpyHostToDevice));
+    /* ---- 4b. GPU unpack + desymbolise -> coefficients, straight over the device plane ---- */
+    int nblocks = dmp.ns / 4;
+    std::vector<bdesc> bds(nblocks);
+    for (int b = 0; b < nblocks; b++)
+        bds[b] = { desc[b * 4].x0, desc[b * 4].y0, desc[b * 4].bw, desc[b * 4].bh, desc[b * 4].mb };
+
+    uint32_t stride2 = 1;
+    for (uint32_t i = 0; i < dmp.ns; i++) {
+        uint32_t b2 = (dmp.slen[i] * SYMBITS + 7) / 8;
+        if (b2 > stride2) stride2 = b2;
+    }
+    std::vector<uint32_t> b2off(dmp.ns + 1);
+    for (uint32_t i = 0; i < dmp.ns; i++) b2off[i] = i * stride2;
+    b2off[dmp.ns] = dmp.ns * stride2;
+
+    uint8_t *d_bits2; uint32_t *d_b2off; bdesc *d_bd;
+    HIPCHECK(hipMalloc(&d_bits2, (size_t)dmp.ns * stride2));
+    HIPCHECK(hipMalloc(&d_b2off, (dmp.ns + 1) * 4));
+    HIPCHECK(hipMalloc(&d_bd, nblocks * sizeof(bdesc)));
+    HIPCHECK(hipMemcpy(d_b2off, b2off.data(), (dmp.ns + 1) * 4, hipMemcpyHostToDevice));
+    HIPCHECK(hipMemcpy(d_bd, bds.data(), nblocks * sizeof(bdesc), hipMemcpyHostToDevice));
+
     HIPCHECK(hipDeviceSynchronize());
+    HIPCHECK(hipEventRecord(ev[2]));
+    k_unpack<<<nbs, 128>>>(d_dsym, d_so, d_sl, d_bits2, d_b2off, (int)dmp.ns);
+    int nbb = (nblocks + 127) / 128;
+    k_desym<<<nbb, 128>>>(d_bits2, d_b2off, d_bd, d, w, nblocks);
+    HIPCHECK(hipEventRecord(ev[3]));
+    HIPCHECK(hipGetLastError());
+    HIPCHECK(hipDeviceSynchronize());
+    float ms_desym = 0; HIPCHECK(hipEventElapsedTime(&ms_desym, ev[2], ev[3]));
+
+    std::vector<int16_t> gcoef(npx);
+    HIPCHECK(hipMemcpy(gcoef.data(), d, npx * 2, hipMemcpyDeviceToHost));
+    size_t coef_bad = 0;
+    for (size_t i = 0; i < npx; i++) if (gcoef[i] != coef2[i]) coef_bad++;
+    printf("4b. GPU desymbolise    %7.2f ms   %s (%zu/%zu coefficients differ)\n", ms_desym,
+           coef_bad ? "MISMATCH" : "coefficients identical to reference decode", coef_bad, npx);
+    if (coef_bad) return 1;
+
+    /* ---- 6. GPU inverse transform on the reconstructed plane ---- */
     HIPCHECK(hipEventRecord(ev[6]));
     for (int L = nl - 1; L >= 0; L--) {
         lift(false, 1, (long)w, ch[L], cw[L]);
@@ -364,12 +403,12 @@ int main(int argc, char **argv)
     std::vector<int16_t> rec(npx);
     HIPCHECK(hipMemcpy(rec.data(), d, npx * 2, hipMemcpyDeviceToHost));
     int pix_ok = memcmp(rec.data(), img.data(), npx * 2) == 0;
-    printf("5. GPU inverse + ref dec %5.2f ms   %s\n", ms_inv,
-           pix_ok ? "round-trip pixels bit-exact" : "*** PIXEL MISMATCH ***");
+    printf("6. GPU inverse         %7.2f ms   %s\n", ms_inv,
+           pix_ok ? "round-trip pixels bit-exact, no host codec stage" : "*** PIXEL MISMATCH ***");
 
-    double gpu_ms = ms_fwd + ms_symemit + ms_pack + ms_tables + ms_enc + ms_dec + ms_inv;
-    printf("\nGPU pipeline: fwd %.2f | sym+emit %.2f | pack %.2f | hist+norm %.2f | enc %.2f | dec %.2f | inv %.2f  = %.2f ms\n",
-           ms_fwd, ms_symemit, ms_pack, ms_tables, ms_enc, ms_dec, ms_inv, gpu_ms);
+    double gpu_ms = ms_fwd + ms_symemit + ms_pack + ms_tables + ms_enc + ms_dec + ms_desym + ms_inv;
+    printf("\nGPU pipeline: fwd %.2f | sym+emit %.2f | pack %.2f | hist+norm %.2f | enc %.2f | dec %.2f | desym %.2f | inv %.2f  = %.2f ms\n",
+           ms_fwd, ms_symemit, ms_pack, ms_tables, ms_enc, ms_dec, ms_desym, ms_inv, gpu_ms);
     printf("host oracle (validation only, not part of the pipeline): symbolise %.1f ms, reference decode %.1f ms\n",
            ms_sym, ms_rd);
     printf("bitrate %.3f bpp   equivalent %.1f fps\n",
