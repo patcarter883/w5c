@@ -1,4 +1,31 @@
-# GPU rANS encoder
+# GPU wavelet codec
+
+**MVP: `w5c` is the codec.** Encode a raw plane to a self-contained bitstream and back,
+bit-exactly:
+
+```
+make
+./w5c enc <in.raw> <out.w5c> <w> <h> [levels]     # raw plane: 16-bit LE (>8-bit) or 8-bit
+./w5c dec <in.w5c> <out.raw>
+
+./w5c enc /tmp/pl_y.raw /tmp/y.w5c 1920 1080 5
+  -> 1367980 B, 5.278 bpp, 4147200 -> 1367980 bytes
+  -> fwd 1.69 ms  sym 18.62  pack 2.07  hist 1.28  enc 1.27  = 24.92 ms
+./w5c dec /tmp/y.w5c /tmp/y_out.raw
+  -> rANS 3.14 ms  desym 25.93 ms  inv 0.19 ms
+```
+
+`cmp` on the input and output: **bit-exact**. One plane per stream — 4:2:0/4:2:2 content is
+three streams, encoded independently; there is no single multi-plane container yet, and no
+rate control (lossless only).
+
+Container: `"W5C1"`, then w/h/levels/block/stream/table counts, the frequency tables, per-block
+bitplane counts, per-stream symbol and payload lengths, then the payloads concatenated.
+
+The pipeline itself lives in `pipeline.hip` and is shared by `w5c` and the `codec_gpu`
+validation harness — the kernel launch sequence exists in exactly one place.
+
+# Harnesses
 
 One work-item per independent `(code-block, context)` stream — the parallelism model from the
 brief. Encodes the exact symbol streams the scalar reference produced and must reproduce its
@@ -146,13 +173,13 @@ per pixel in 4:2:2), so all rows are on the same basis.
 | codec | bytes/frame | bpp | encode ms/frame | quality |
 |---|---|---|---|---|
 | SVT-JPEG-XS @2.0 bits/luma-px | 518,400 | 1.000 | **9.19** | 40.37 dB |
-| SVT-JPEG-XS @3.0 bits/luma-px | 777,600 | 1.500 | 10.63 | 43.43 dB |
-| **this codec (GPU)** | **2,772,131** | **5.347** | **83.54** | **lossless** |
-| DNxHR HQX | 917,569 | 1.770 | 34.08 | 31.77 dB |
-| VC-2 5/3 (tol=0) | 2,492,808 | 4.809 | 12.18 | 31.81 dB |
-| FFV1 level 3 | 2,451,713 | 4.729 | 30.74 | **lossless** |
+| SVT-JPEG-XS @3.0 bits/luma-px | 777,600 | 1.500 | 10.74 | 43.43 dB |
+| DNxHR HQX | 917,569 | 1.770 | 33.89 | 31.77 dB |
+| VC\(-\)2 5/3 (tol=0) | 2,492,808 | 4.809 | 12.46 | 31.81 dB |
+| **this codec (GPU)** | **2,775,698** | **5.354** | **84.50** | **lossless** |
+| FFV1 level 3 | 2,451,713 | 4.729 | 31.88 | **lossless** |
 
-Encode-only and decode-only: **83.54 / 89.95 ms** per 4:2:2 frame (three planes).
+Encode-only and decode-only: **84.50 / 98.39 ms** per 4:2:2 frame (three planes, measured with `w5c`).
 
 ### What this actually says — it is not competitive yet
 

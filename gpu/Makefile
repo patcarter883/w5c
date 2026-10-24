@@ -2,7 +2,7 @@ HIP ?= hipcc
 ARCH ?= gfx1201
 REF  := ../ref
 
-BINS := rans_gpu rans_dec dwt_gpu sym_gpu codec_gpu
+BINS := rans_gpu rans_dec dwt_gpu sym_gpu codec_gpu w5c
 
 all: $(BINS)
 
@@ -27,6 +27,12 @@ codec_gpu.o: codec_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
 
 # the CPU reference is linked in as the spec, not reimplemented
 codec_gpu: codec_gpu.o codec_ref.o wavelet_ref.o
+	$(HIP) -o $@ $^
+
+w5c.o: w5c.hip pipeline.hip kernels.hi $(REF)/wavelet.h
+	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
+
+w5c: w5c.o wavelet_ref.o
 	$(HIP) -o $@ $^
 
 codec_ref.o: $(REF)/codec.c $(REF)/codec.h
@@ -60,6 +66,9 @@ check: all dumps
 	./codec_gpu 1920 1080 5 0
 	./codec_gpu 3840 2160 5 0
 	./codec_gpu 1920 1080 5 ../ref/testdata/f0000_g8.y8
+	./w5c enc $(REF)/testdata/f0000_g8.y8 /tmp/w5c_rt.w5c 1920 1080 5
+	./w5c dec /tmp/w5c_rt.w5c /tmp/w5c_rt.raw
+	cmp $(REF)/testdata/f0000_g8.y8 /tmp/w5c_rt.raw && echo "w5c file round-trip bit-exact"
 	@echo "all binaries validated"
 
 clean:

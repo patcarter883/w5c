@@ -484,6 +484,26 @@ __global__ void k_unpack(const uint8_t * __restrict__ syms,
 
 struct bdesc { int x0, y0, bw, bh, mb; };
 
+/* block bitplane count, so the host never has to download the whole plane to learn it */
+__global__ void k_block_mb(const int16_t * __restrict__ plane, int w,
+                           bdesc * __restrict__ bd, int nblocks)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    bdesc d = bd[b];
+    int mx = 0;
+    for (int y = 0; y < d.bh; y++) {
+        const int16_t *row = plane + (size_t)(d.y0 + y) * w + d.x0;
+        for (int x = 0; x < d.bw; x++) {
+            int v = row[x]; v = v < 0 ? -v : v;
+            if (v > mx) mx = v;
+        }
+    }
+    int mb = 0;
+    while (mx) { mb++; mx >>= 1; }
+    bd[b].mb = mb;
+}
+
 /* One thread per code-block: the walk interleaves the four contexts, so it cannot be split
    per context. Magnitude is accumulated straight into the destination plane and the sign is
    held in a small bitmap, which avoids a per-coefficient state array. */

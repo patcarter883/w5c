@@ -70,19 +70,20 @@ done
 
 echo
 echo "== this codec (GPU, per-plane; 3 planes summed) =="
+# the GPU has been idle while the CPU codecs ran: warm the clocks before measuring
+ffmpeg -y -v error $RAW1 -vf "extractplanes=y" -f rawvideo -pix_fmt gray10le "$D/warm.raw"
+for i in $(seq 1 12); do "$GPU/codec_gpu" 1920 1080 5 "$D/warm.raw" >/dev/null 2>&1; done
 # extract one frame per plane and encode; median of 5 pipeline runs per plane
 TOTB=0; TOTE=0; TOTD=0
 for p in y u v; do
   wpx=$W; [ "$p" != "y" ] && wpx=$((W / 2))
   ffmpeg -y -v error $RAW1 -vf "extractplanes=$p" -f rawvideo -pix_fmt gray10le "$D/pl_$p.raw"
-  best=""
-  for i in 1 2 3 4 5; do
-    line=$("$GPU/codec_gpu" "$wpx" 1080 5 "$D/pl_$p.raw" 2>/dev/null | grep -oE "bytes=[0-9]+ ms=[0-9.]+ enc=[0-9.]+ dec=[0-9.]+")
-    echo "$line" >> "$D/plane_$p.txt"
+  for i in $(seq 1 8); do
+    "$GPU/w5c" enc "$D/pl_$p.raw" "$D/pl_$p.w5c" "$wpx" 1080 5 2>/dev/null | grep -oE "bytes=[0-9]+ enc=[0-9.]+" >> "$D/plane_$p.txt"
   done
   b=$(grep -oE "bytes=[0-9]+" "$D/plane_$p.txt" | cut -d= -f2 | head -1)
   e=$(grep -oE "enc=[0-9.]+" "$D/plane_$p.txt" | cut -d= -f2 | sort -n | head -1)
-  d=$(grep -oE "dec=[0-9.]+" "$D/plane_$p.txt" | cut -d= -f2 | sort -n | head -1)
+  d=$("$GPU/w5c" dec "$D/pl_$p.w5c" /dev/null 2>/dev/null | grep -oE "dec=[0-9.]+" | cut -d= -f2)
   TOTB=$((TOTB + b)); TOTE=$(awk -v a="$TOTE" -v b="$e" 'BEGIN{print a+b}'); TOTD=$(awk -v a="$TOTD" -v b="$d" 'BEGIN{print a+b}')
   printf "  plane %s (%dx1080): %8d B  enc %6.2f ms  dec %6.2f ms\n" "$p" "$wpx" "$b" "$e" "$d"
   rm -f "$D/plane_$p.txt"
