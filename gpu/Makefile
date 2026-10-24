@@ -51,10 +51,18 @@ dumps:
 check: all dumps
 	./dwt_gpu 1920 1080 5 0
 	./dwt_gpu 3840 2160 5 0
+	./dwt_gpu 37 23 5 0
 	./rans_gpu /tmp/d1080
-	./rans_gpu /tmp/d4k
+	./rans_dec /tmp/d1080
+	./rans_dec /tmp/d4k
+	./sym_gpu 1920 1080 5 0
+	./sym_gpu 1920 1080 5 ../ref/testdata/f0000_g8.y8
+	./codec_gpu 1920 1080 5 0
+	./codec_gpu 3840 2160 5 0
+	./codec_gpu 1920 1080 5 ../ref/testdata/f0000_g8.y8
+	@echo "all binaries validated"
 
 clean:
-	rm -f rans_gpu dwt_gpu dwt_gpu.o wavelet_ref.o
+	rm -f $(BINS) *.o
 
 .PHONY: all check dumps clean
