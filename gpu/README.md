@@ -306,7 +306,15 @@ Encode-only and decode-only for this codec: **8.56 / 5.26 ms** per 4:2:2 frame a
 measured with `w5c` (best of 8). That makes it the fastest encoder in this table — ahead of
 SVT-JPEG-XS at 1.0 bpp — while remaining lossless.
 
+> **This table predates two later changes.** Varint container lengths and warp-parallel
+> desymbolise landed after it was measured, so its "this codec" row (5.644 bpp, 8.56/5.26 ms) is
+> superseded by the current **5.460 bpp, 6.2 ms encode, 3.4 ms decode** in the MVP section above.
+> The rows for the other codecs are unaffected. Kept as measured rather than silently restated.
+
 ### What this actually says
+
+Conclusions drawn from the run above: the rank ordering still holds, though the absolute figures
+for this codec have since moved (see the note above).
 
 1. **Speed: the GPU is now paying for itself.** 10.17 ms encode against FFV1's 31.16 ms on the
    CPU — 3.1x faster than the only true-lossless peer here, and faster than VC-2 (12.43) and
