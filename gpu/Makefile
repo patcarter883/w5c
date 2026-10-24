@@ -2,13 +2,29 @@ HIP ?= hipcc
 ARCH ?= gfx1201
 REF  := ../ref
 
-all: rans_gpu dwt_gpu rans_dec
+BINS := rans_gpu rans_dec dwt_gpu codec_gpu
 
-rans_gpu: rans_gpu.hip
+all: $(BINS)
+
+# shared device code lives in kernels.hi — every binary includes it, none duplicates it
+rans_gpu: rans_gpu.hip kernels.hi
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -o $@ $<
 
-rans_dec: rans_dec.hip
+rans_dec: rans_dec.hip kernels.hi
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -o $@ $<
+
+dwt_gpu.o: dwt_gpu.hip kernels.hi $(REF)/wavelet.h
+	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
+
+codec_gpu.o: codec_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
+	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
+
+# the CPU reference is linked in as the spec, not reimplemented
+codec_gpu: codec_gpu.o codec_ref.o wavelet_ref.o
+	$(HIP) -o $@ $^
+
+codec_ref.o: $(REF)/codec.c $(REF)/codec.h
+	gcc -O2 -std=c11 -c -o $@ $<
 
 # the CPU reference transform is linked in so the GPU is validated against the real spec
 wavelet_ref.o: $(REF)/wavelet.c

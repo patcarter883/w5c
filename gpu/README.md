@@ -44,6 +44,37 @@ matter here (the transform is ~0.03% of the codec budget) but it is why this is 
 Floor is ~0.4 ms across all sizes: 10 kernel launches of overhead. Irrelevant at HD/4K,
 dominant below ~320×240.
 
+## End-to-end driver
+
+`codec_gpu` chains the whole codec and validates every stage against the reference:
+
+```
+1. GPU fwd transform      coefficients match reference
+2. host symbolise         (the one stage still not on the device)
+3. GPU rANS encode        bitstream byte-identical to reference
+4. GPU rANS decode        symbol streams identical to reference
+5. GPU inverse transform  round-trip pixels bit-exact
+```
+
+Result: **END-TO-END LOSSLESS, BIT-EXACT** at 1080p synthetic, 4K synthetic, and real camera
+content (8-bit, 3.584 bpp).
+
+### Stage split — the number that decides the next move
+
+| frame | fwd | symbolise (host) | rANS enc | rANS dec | inv | GPU share |
+|---|---|---|---|---|---|---|
+| 1080p real | 2.9 ms | **137 ms** | 1.6 ms | 1.5 ms | 2.3 ms | 5.7% |
+| 1080p synth | 2.7 ms | **178 ms** | 0.9 ms | 1.7 ms | 2.7 ms | 2.9% |
+| 4K synth | 4.1 ms | **760 ms** | 2.9 ms | 3.3 ms | 0.6 ms | 1.4% |
+
+Every GPU stage together is 6–11 ms. The host symbolisation is **94–98% of the pipeline**.
+The GPU is no longer the constraint anywhere — the last host-side stage is the whole problem,
+and that is precisely the case for writing the symbolisation kernel.
+
+(The driver also runs a reference decode for validation, ~90 ms at 1080p / ~370 ms at 4K. That
+is a test harness stage, not a codec cost, and it is excluded from the GPU share above. A real
+decoder needs a GPU desymboliser, which is the mirror of the missing symbolisation kernel.)
+
 ## Entropy decode
 
 ```

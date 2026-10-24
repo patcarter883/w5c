@@ -1,110 +1,12 @@
-/* GPU 5/3 lifting transform, validated bit-exact against the scalar reference.
+/* GPU 5/3 lifting transform harness. Validates the device transform in kernels.hi
+   against the scalar reference (wavelet.c) and times it.
 
-   One work-group per line. Each 1D lifting pass is two parallel phases separated by
-   a barrier: predict needs only input samples, update needs the predicted detail
-   coefficients. No transpose and no strided global access pattern beyond the natural
-   column walk, which the work-group absorbs into shared memory.
-
-   Build: hipcc -O3 -std=c++17 --offload-arch=gfx1201 -o dwt_gpu dwt_gpu.hip wavelet.c
-   Run:   ./dwt_gpu [w] [h] [levels]
+   Build: see Makefile.  Run: ./dwt_gpu [w] [h] [levels] [kind]
 */
-#include <hip/hip_runtime.h>
+#include "kernels.hi"
 extern "C" {
 #include "wavelet.h"
 }
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <cmath>
-#include <vector>
-#include <ctime>
-
-/* whole-sample symmetric extension, matching wavelet.c exactly */
-__device__ __forceinline__ int mir(int i, int n)
-{
-    while (i < 0 || i >= n) {
-        if (i < 0) i = -i - 1;
-        else       i = 2 * n - 1 - i;
-    }
-    return i;
-}
-
-__global__ void k_lift1d_fwd(int16_t * __restrict__ buf, long off, long line_pitch,
-                             long stride, int n)
-{
-    extern __shared__ int16_t sh[];
-    int line = blockIdx.x;
-    int16_t *p = buf + off + (long)line * line_pitch;
-    int16_t *src = sh, *dst = sh + n;
-    int nev = (n + 1) / 2, nod = n / 2;
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) src[i] = p[(long)i * stride];
-    __syncthreads();
-    if (n <= 1) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = src[i];
-        return;
-    }
-
-    /* predict: d[i] = odd[i] - ((ev[i] + ev[i+1]) >> 1) */
-    for (int i = threadIdx.x; i < nod; i += blockDim.x) {
-        int a = src[2 * mir(i, nev)], b = src[2 * mir(i + 1, nev)];
-        dst[nev + i] = (int16_t)(src[2 * i + 1] - ((a + b) >> 1));
-    }
-    __syncthreads();
-
-    /* update: s[i] = ev[i] + ((d[i-1] + d[i] + 2) >> 2) */
-    for (int i = threadIdx.x; i < nev; i += blockDim.x) {
-        int dm = dst[nev + mir(i - 1, nod)], dp = dst[nev + mir(i, nod)];
-        dst[i] = (int16_t)(src[2 * i] + ((dm + dp + 2) >> 2));
-    }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = dst[i];
-}
-
-__global__ void k_lift1d_inv(int16_t * __restrict__ buf, long off, long line_pitch,
-                             long stride, int n)
-{
-    extern __shared__ int16_t sh[];
-    int line = blockIdx.x;
-    int16_t *p = buf + off + (long)line * line_pitch;
-    int16_t *src = sh, *dst = sh + n;
-    int nev = (n + 1) / 2, nod = n / 2;
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) src[i] = p[(long)i * stride];
-    __syncthreads();
-    if (n <= 1) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = src[i];
-        return;
-    }
-
-    /* undo update: ev[i] = s[i] - ((d[i-1] + d[i] + 2) >> 2) */
-    for (int i = threadIdx.x; i < nev; i += blockDim.x) {
-        int dm = src[nev + mir(i - 1, nod)], dp = src[nev + mir(i, nod)];
-        dst[2 * i] = (int16_t)(src[i] - ((dm + dp + 2) >> 2));
-    }
-    __syncthreads();
-
-    /* undo predict: odd[i] = d[i] + ((ev[i] + ev[i+1]) >> 1) */
-    for (int i = threadIdx.x; i < nod; i += blockDim.x) {
-        int a = dst[2 * mir(i, nev)], b = dst[2 * mir(i + 1, nev)];
-        dst[2 * i + 1] = (int16_t)(src[nev + i] + ((a + b) >> 1));
-    }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = dst[i];
-}
-
-/* ------------------------------------------------------------------ helpers */
-static double now_s()
-{
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
-#define HIPCHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
-    fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, hipGetErrorString(e)); exit(1); } } while (0)
 
 static void gen(int16_t *p, int w, int h, int bits, int kind)
 {
@@ -120,19 +22,6 @@ static void gen(int16_t *p, int w, int h, int bits, int kind)
             if (v < 0) v = 0; if (v > m) v = m;
             p[(size_t)y * w + x] = (int16_t)v;
         }
-}
-
-/* level sizes, identical to wavelet.c */
-static int level_sizes(int w, int h, int levels, int *cw, int *ch)
-{
-    int nl = 0, a = w, b = h;
-    for (int L = 0; L < levels; L++) {
-        if (a < 2 || b < 2) break;
-        cw[nl] = a; ch[nl] = b; nl++;
-        a = (a + 1) / 2; b = (b + 1) / 2;
-    }
-    cw[nl] = a; ch[nl] = b;
-    return nl;
 }
 
 int main(int argc, char **argv)
@@ -160,8 +49,6 @@ int main(int argc, char **argv)
 
     int16_t *d = nullptr;
     HIPCHECK(hipMalloc(&d, npx * 2));
-    memcpy(gpu.data(), ref.data(), npx * 2);
-    /* restore the untransformed frame for the GPU run */
     gen(gpu.data(), w, h, 10, kind);
     HIPCHECK(hipMemcpy(d, gpu.data(), npx * 2, hipMemcpyHostToDevice));
 
@@ -173,14 +60,13 @@ int main(int argc, char **argv)
         HIPCHECK(hipGetLastError());
     };
 
-    /* forward: per level, rows then columns */
     hipEvent_t e0, e1;
     HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
     HIPCHECK(hipDeviceSynchronize());
     HIPCHECK(hipEventRecord(e0));
     for (int L = 0; L < nl; L++) {
-        launch(true, 0, (long)w, 1, cw[L], ch[L]);          /* rows: line = y, stride 1 */
-        launch(true, 0, 1, (long)w, ch[L], cw[L]);          /* cols: line = x, stride w */
+        launch(true, 0, (long)w, 1, cw[L], ch[L]);          /* rows */
+        launch(true, 0, 1, (long)w, ch[L], cw[L]);          /* cols */
     }
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipDeviceSynchronize());
@@ -196,15 +82,13 @@ int main(int argc, char **argv)
     }
     printf("forward coefficients: %s (%zu/%zu differ, max|delta|=%d)\n",
            diff ? "MISMATCH" : "bit-exact vs reference", diff, npx, maxd);
-
     printf("CPU reference fwd: %.1f ms   GPU fwd: %.2f ms  (%.1fx)\n",
            t_ref * 1e3, ms, t_ref * 1e3 / ms);
-    double gbs = (double)npx * 2 * 2 / (ms * 1e-3) / 1e9;   /* read+write, 2 bytes */
-    printf("GPU effective bandwidth: %.1f GB/s (int16 plane, read+write)\n", gbs);
+    printf("GPU effective bandwidth: %.1f GB/s (int16 plane, read+write)\n",
+           (double)npx * 2 * 2 / (ms * 1e-3) / 1e9);
 
     if (diff) { printf("FAIL\n"); return 1; }
 
-    /* inverse */
     HIPCHECK(hipEventRecord(e0));
     for (int L = nl - 1; L >= 0; L--) {
         launch(false, 0, 1, (long)w, ch[L], cw[L]);         /* cols first */
@@ -225,9 +109,8 @@ int main(int argc, char **argv)
     printf("round-trip pixels:     %s (%zu/%zu differ, max|delta|=%d)\n",
            diff2 ? "MISMATCH" : "bit-exact vs original", diff2, npx, maxd2);
     printf("GPU inverse: %.2f ms\n", ms2);
+    printf("\n%s\n", (diff == 0 && diff2 == 0) ? "transform bit-exact on GPU" : "*** MISMATCH ***");
 
-    printf("\n%s\n", (diff == 0 && diff2 == 0) ? "transform bit-exact on GPU"
-                                               : "*** MISMATCH ***");
     hipFree(d);
     return (diff || diff2) ? 1 : 0;
 }

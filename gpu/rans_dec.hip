@@ -7,85 +7,9 @@
    Build: hipcc -O3 -std=c++17 --offload-arch=gfx1201 -o rans_dec rans_dec.hip
    Run:   ./rans_dec /tmp/d4k
 */
-#include <hip/hip_runtime.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <vector>
-#include <algorithm>
-#include <ctime>
-
-#define RSB     12
-#define RSZ     (1u << RSB)
-#define RANS_L  (1u << 23)
-#define SYMBITS 6
-#define NSYM    (1 << SYMBITS)
-
-struct dtab_t {
-    uint32_t start[NSYM];
-    uint16_t freq[NSYM];
-    uint8_t  slot[RSZ];          /* 4 KB: decode lookup */
-};
-
-__global__ void k_dec(const uint8_t * __restrict__ enc,
-                      const uint32_t * __restrict__ eoff,
-                      const uint32_t * __restrict__ elen,
-                      const uint16_t * __restrict__ stab,
-                      uint8_t * __restrict__ sym,
-                      const uint32_t * __restrict__ soff,
-                      const uint32_t * __restrict__ slen,
-                      const dtab_t * __restrict__ tabs,
-                      int * __restrict__ err,
-                      int nstreams)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nstreams) return;
-
-    uint32_t n = slen[i];
-    if (n == 0) return;
-
-    const dtab_t *t = &tabs[stab[i]];
-    const uint8_t *in = enc + eoff[i];
-    uint32_t len = elen[i];
-    uint8_t *out = sym + soff[i];
-    if (len < 4) { err[i] = 1; return; }
-
-    size_t p = 4;
-    uint32_t x = (uint32_t)in[0] | ((uint32_t)in[1] << 8) |
-                 ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
-
-    for (uint32_t k = 0; k < n; k++) {
-        uint32_t slot = x & (RSZ - 1);
-        uint8_t s = t->slot[slot];
-        out[k] = s;
-        x = (uint32_t)t->freq[s] * (x >> RSB) + slot - t->start[s];
-        while (x < RANS_L) {
-            if (p >= len) { err[i] = 2; return; }
-            x = (x << 8) | in[p++];
-        }
-    }
-}
+#include "kernels.hi"
 
 /* ---------------------------------------------------------------- helpers */
-static std::vector<uint8_t> slurp(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> v((size_t)n);
-    if (n && fread(v.data(), 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "short read\n"); exit(1); }
-    fclose(f);
-    return v;
-}
-static double now_s()
-{
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
-#define HIPCHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
-    fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, hipGetErrorString(e)); exit(1); } } while (0)
-
 static void cpu_dec(uint8_t *out, uint32_t n, const dtab_t *t, const uint8_t *in, uint32_t len)
 {
     size_t p = 4;

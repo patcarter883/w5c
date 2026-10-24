@@ -5,131 +5,11 @@
    Build: hipcc -O3 -std=c++17 --offload-arch=gfx1201 -o rans_gpu rans_gpu.hip
    Run:   ./rans_gpu /tmp/d1080      (expects .sym .enc .tab from DUMP=/tmp/d1080)
 */
-#include <hip/hip_runtime.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <vector>
-#include <algorithm>
-#include <ctime>
+#include "kernels.hi"
 
-#define RSB     12
-#define RSZ     (1u << RSB)
-#define RANS_L  (1u << 23)
-#define SYMBITS 6
-#define NSYM    (1 << SYMBITS)
-#define MAXTAB  128
 
-struct gtab_t {
-    uint16_t freq[NSYM];
-    uint32_t start[NSYM];
-    uint32_t rcp[NSYM];      /* floor(2^32/f)+1: exact reciprocal for x<2^31 */
-};
-
-__constant__ gtab_t c_tab[MAXTAB];
-
-__global__ void k_enc(const uint8_t * __restrict__ sym,
-                      const uint32_t * __restrict__ soff,
-                      const uint32_t * __restrict__ slen,
-                      const uint16_t * __restrict__ stab,
-                      const uint32_t * __restrict__ cap,
-                      const uint32_t * __restrict__ ooff,
-                      uint8_t * __restrict__ out,
-                      uint32_t * __restrict__ olen,
-                      int nstreams)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nstreams) return;
-
-    uint32_t n = slen[i];
-    if (n == 0) { olen[i] = 0; return; }
-
-    const gtab_t *t = &c_tab[stab[i]];
-    const uint8_t *s = sym + soff[i];
-    uint32_t cp = cap[i];
-    uint8_t *base = out + ooff[i];
-    uint8_t *p = base + cp;
-    uint32_t x = RANS_L;
-
-    for (uint32_t k = n; k-- > 0;) {
-        uint32_t f = t->freq[s[k]], st = t->start[s[k]];
-        uint32_t x_max = ((RANS_L >> RSB) << 8) * f;
-        while (x >= x_max) { *--p = (uint8_t)x; x >>= 8; }
-        x = ((x / f) << RSB) + (x % f) + st;
-    }
-    p -= 4;
-    p[0] = (uint8_t)x; p[1] = (uint8_t)(x >> 8);
-    p[2] = (uint8_t)(x >> 16); p[3] = (uint8_t)(x >> 24);
-    uint32_t sz = (uint32_t)(base + cp - p);
-    for (uint32_t j = 0; j < sz; j++) base[j] = p[j];
-    olen[i] = sz;
-}
-
-/* Same encoder without integer division: q = floor(x/f) via a reciprocal
-   multiply. rcp = floor(2^31/f)+1 with the invariant x < 2^31, so the estimate
-   is exact or one too high (error < 1) and a single decrement fixes it. */
-__global__ void k_enc_rcp(const uint8_t * __restrict__ sym,
-                          const uint32_t * __restrict__ soff,
-                          const uint32_t * __restrict__ slen,
-                          const uint16_t * __restrict__ stab,
-                          const uint32_t * __restrict__ cap,
-                          const uint32_t * __restrict__ ooff,
-                          uint8_t * __restrict__ out,
-                          uint32_t * __restrict__ olen,
-                          int nstreams)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nstreams) return;
-
-    uint32_t n = slen[i];
-    if (n == 0) { olen[i] = 0; return; }
-
-    const gtab_t *t = &c_tab[stab[i]];
-    const uint8_t *s = sym + soff[i];
-    uint32_t cp = cap[i];
-    uint8_t *base = out + ooff[i];
-    uint8_t *p = base + cp;
-    uint32_t x = RANS_L;
-
-    for (uint32_t k = n; k-- > 0;) {
-        uint32_t f = t->freq[s[k]], st = t->start[s[k]];
-        uint32_t x_max = ((RANS_L >> RSB) << 8) * f;
-        while (x >= x_max) { *--p = (uint8_t)x; x >>= 8; }
-        uint32_t q = (uint32_t)(((uint64_t)x * t->rcp[s[k]]) >> 31);
-        uint32_t r = x - q * f;
-        if ((int32_t)r < 0) { q--; r += f; }
-        x = (q << RSB) + r + st;
-    }
-    p -= 4;
-    p[0] = (uint8_t)x; p[1] = (uint8_t)(x >> 8);
-    p[2] = (uint8_t)(x >> 16); p[3] = (uint8_t)(x >> 24);
-    uint32_t sz = (uint32_t)(base + cp - p);
-    for (uint32_t j = 0; j < sz; j++) base[j] = p[j];
-    olen[i] = sz;
-}
 
 /* ---------------------------------------------------------------- helpers */
-static std::vector<uint8_t> slurp(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> v((size_t)n);
-    if (n && fread(v.data(), 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "short read %s\n", path); exit(1); }
-    fclose(f);
-    return v;
-}
-
-static double now_s()
-{
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
-
-#define HIPCHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
-    fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, hipGetErrorString(e)); exit(1); } } while (0)
-
 /* Same encoder, single-threaded, for an apples-to-apples CPU number. */
 static size_t cpu_enc(uint8_t *out, uint32_t cp, const gtab_t *t, const uint8_t *s, uint32_t n)
 {
@@ -164,17 +44,10 @@ int main(int argc, char **argv)
     uint32_t nsb = thdr[0], nctx = thdr[1], nsym = thdr[2];
     if (nsym != NSYM) { fprintf(stderr, "NSYM mismatch: dump %u, kernel %d\n", nsym, NSYM); return 1; }
     if (nsb * nctx > MAXTAB) { fprintf(stderr, "too many tables %u\n", nsb * nctx); return 1; }
-    std::vector<gtab_t> tabs(nsb * nctx);
-    size_t tp = 12;
-    for (uint32_t i = 0; i < nsb * nctx; i++) {
-        memcpy(tabs[i].freq, tabf.data() + tp, NSYM * 2); tp += NSYM * 2;
-        uint32_t acc = 0;
-        for (int k = 0; k < NSYM; k++) { tabs[i].start[k] = acc; acc += tabs[i].freq[k]; }
-        for (int k = 0; k < NSYM; k++)
-            tabs[i].rcp[k] = tabs[i].freq[k]
-                ? (uint32_t)(((1ULL << 31) / tabs[i].freq[k]) + 1) : 0;
-        if (acc != RSZ) { fprintf(stderr, "table %u sums to %u\n", i, acc); return 1; }
-    }
+    std::vector<uint16_t> freqs((size_t)nsb * nctx * NSYM);
+    memcpy(freqs.data(), tabf.data() + 12, freqs.size() * 2);
+    std::vector<gtab_t> tabs;
+    build_gtabs(tabs, freqs, nsb * nctx);
 
     /* --- streams --- */
     uint32_t shdr[4];
