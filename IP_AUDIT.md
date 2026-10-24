@@ -1,64 +1,58 @@
-# IP / claim-boundary audit — technical findings
+# Prior art and claim boundaries
 
-**This is a technical audit, not legal advice.** It maps what the source code actually does onto
-published prior art, with dates. It does not construe patent claims, does not assess validity,
-and cannot substitute for counsel's opinion. A real claim chart requires the granted claim text
-element by element; see §4 for why that could not be done here.
+This document records the prior art behind the coding tools in this repository, and the claim
+position for the patents that bear on them. It maps what the code does onto published literature
+with dates, and reads the granted claims of the patents that come closest.
 
-Scope: the `ref/` reference codec and the `gpu/` implementation, as committed at `94456af`.
+It is a technical analysis, not legal advice. It does not construe claims, assess validity, or
+substitute for counsel. A claim chart needs the granted claim text element by element and the file
+history; §8 lists what is still outstanding.
+
+Scope: the `ref/` reference codec and the `gpu/` implementation.
 
 ---
 
-## 1. Verified inventory — what the code actually contains
-
-Established by reading the source, not from the design briefs.
+## 1. What the code contains
 
 | Component | Fact | Location |
 |---|---|---|
 | Transform | 2D LeGall 5/3 integer lifting, 5 levels, packed Mallat subband layout | `ref/wavelet.c`, `gpu/kernels.hi` (`k_dwt_fwd_split`, `k_dwt_inv_split`) |
 | Extension | Whole-sample symmetric (mirror), `mir()` loop form | `ref/wavelet.c:5`, `gpu/kernels.hi:106` |
-| Slicing | Optional band-independent transform; **default off** (`slice_h = 0`) | `gpu/w5c.hip:96`, `plane_dwt_all()` |
-| Line buffering | **None.** No FIFO, ring buffer or line-buffer abstraction exists — 0 grep hits for `fifo`/`ring`/`line_buf`/`circular`. The transform reads plane memory through row pointers. | — |
+| Slicing | Optional band-independent transform; default off (`slice_h = 0`) | `gpu/w5c.hip:96`, `plane_dwt_all()` |
+| Line buffering | None. No FIFO, ring buffer or line-buffer abstraction exists — 0 grep hits for `fifo`/`ring`/`line_buf`/`circular`. The transform reads plane memory through row pointers. | — |
 | Warp intrinsics | `__shfl_up(x, off, 32)` and `__shfl(x, 31, 32)` only — a 32-lane Hillis-Steele prefix scan | `gpu/kernels.hi:654-657` |
-| Cross-lane permute | **Absent.** No `v_permlanex16_b32`, no `ds_bpermute_b32`, no transpose anywhere. | — |
-| rANS | Byte-wise rANS, `RSB=12` (M=4096), `L=1<<23`, `x_max=((L>>12)<<8)*freq`, division encode, slot-table decode, 4-byte flush | `ref/codec.c:72-74, 161-201` |
+| Cross-lane permute | Absent. No `v_permlanex16_b32`, no `ds_bpermute_b32`, no transpose. | — |
+| rANS | Byte-wise rANS, `RSB=12` (M=4096), `L=1<<23`, `x_max=((L>>12)<<8)*freq`, division encode, slot-table decode, 4-byte terminal state | `ref/codec.c:72-74, 161-201` |
 | rANS (GPU) | Same algorithm, one thread per stream; `k_enc_rcp` variants the division via `rcp=floor(2^31/f)+1` | `gpu/kernels.hi:272-301` |
-| Probability tables | Per-frame, per-subband, per-context histograms computed from the frame and **transmitted in the container** (64 tables, 8 KB) | `pipeline.hip` (`k_hist` → `k_norm` → `build_gtabs`) |
-| Profile selection | **Absent.** No static profile library, no λ bins, no bandwidth or throughput feedback. | — |
+| Probability tables | Per-frame, per-subband, per-context histograms computed from the frame and transmitted in the container (64 tables) | `pipeline.hip` (`k_hist` → `k_norm` → `build_gtabs`) |
+| Profile selection | Absent. No profile library, no λ bins, no bandwidth or throughput feedback. | — |
 | Symbolisation | Bitplane significance with per-group activity flag (`siggrp`), separate sig/sign/refine contexts | `kernels.hi` (`k_sym`, `k_desym_w`) |
 
 ---
 
-## 2. Findings against the four specified targets
+## 2. The coding tools
 
-### T1 — Wavelet lifting pass and slice boundary extension
-**Arithmetic matches the published standard family; no line-buffer structure exists.**
+### 2.1 Transform and slice boundaries
 
 The lifting is the reversible 5/3 integer transform: predict `d = odd − ((e₀+e₁) >> 1)` and update
-`s = even + ((d₋+d₀+2) >> 2)`, evaluated with whole-sample symmetric extension. This is the same
-arithmetic as VC-2 (SMPTE ST 2042-1:2008) and JPEG 2000 (ISO/IEC 15444-1) for the reversible
-filter. It is not bit-stream compatible with either — the container, symbolisation and entropy
-layer are original — so no conformance claim is made or implied.
+`s = even + ((d₋+d₀+2) >> 2)`, evaluated with whole-sample symmetric extension. This is the
+arithmetic VC-2 (SMPTE ST 2042-1:2008) and JPEG 2000 (ISO/IEC 15444-1) specify for the reversible
+filter. The container, symbolisation and entropy layers are original to this codec.
 
-Two corrections to the target's premises:
-- Slice height is **configurable and defaults to whole-frame**; 40 lines was a measured option, not
-  a fixed structural boundary.
-- There is **no sliding FIFO line buffer**. The transform holds a full slice/plane in memory and
-  addresses it by row pointer. Whatever the referenced patent covers, a line-buffer element would
-  find no counterpart here — structurally, not merely by different implementation.
+Slice height is configurable and defaults to whole-frame.
 
-### T2 — Register transpose
-**Target is moot: the operation does not exist in this codebase.**
+There is no sliding line buffer. No FIFO, ring buffer or line-buffer abstraction exists in the
+tree: the transform holds a full slice or plane in memory and addresses it by row pointer. A
+line-buffer claim element has no structural counterpart here.
 
-There is no register transpose, no `permlanex16`, no `ds_bpermute`. An earlier design note
-proposed a matrix-unit identity-matrix transpose; that was rejected on technical grounds and never
-implemented. The only cross-lane primitive used is a 32-lane prefix scan for bit-position masks,
-which is Hillis-Steele (1986). Nothing here reaches into texture-pipeline or
-graphics-property abstractions.
+### 2.2 Cross-lane register movement
 
-### T3 — rANS entropy engine
-**Implementation is the public byte-rANS formulation; state bounds and table maths match it
-exactly.**
+There is no register transpose in this codebase. No `permlanex16`, no `ds_bpermute`, no transpose
+of any kind. The only cross-lane primitive used is a 32-lane prefix scan for bit-position masks,
+which is Hillis-Steele (1986). Nothing here uses a texture-pipeline or graphics-property
+abstraction.
+
+### 2.3 rANS entropy coding
 
 ```
 RANS_L = 1<<23,  RSB = 12,  M = 4096
@@ -68,67 +62,56 @@ decode: slot = x & 4095 ; sym = table[slot]
         x = freq[sym] * (x >> 12) + slot - start[sym] ; while (x < L) x = (x<<8) | byte
 flush:  4-byte state
 ```
-This is the `rans_byte` formulation published by Giesen (`ryg_rans`, README signed **Feb 2014**),
-which is itself a practical packaging of Duda's ANS (**arXiv:1311.2540, Nov 2013**). The GPU
-reciprocal variant uses `rcp = floor(2^31/f)+1` with the invariant `x < 2^31`, which is the
+
+This is the `rans_byte` formulation published by Giesen (`ryg_rans`, README signed Feb 2014), itself
+a practical packaging of Duda's ANS (arXiv:0902.0271, Feb 2009; arXiv:1311.2540, Nov 2013). The GPU
+reciprocal variant uses `rcp = floor(2^31/f)+1` with the invariant `x < 2^31`, the
 Granlund-Montgomery (PLDI 1994) division-by-invariant-integer technique applied to rANS.
 
-Caveat on dates: if any relevant claim has a priority date **before Feb 2014**, `ryg_rans` is not
-prior art to it and the anchor must be Duda (Nov 2013) or earlier ANS/material from 2013. If the
-priority is **after Feb 2014**, ryg_rans is squarely prior art.
+Date note: `ryg_rans` (Feb 2014) is prior art only to claims whose priority is later than that. For
+earlier claims the anchor is Duda's 2009 paper, and the 2013 extension.
 
-### T4 — Profile selection
-**Target is moot: there is no profile selection and no feedback path of any kind.**
+### 2.4 Probability model selection
 
-Tables are per-frame measured histograms, normalised to M=4096 and transmitted. There is no
-hardwired profile library, no λ/Laplacian parameterisation, and no dynamic adjustment driven by
-channel bandwidth, buffer fullness or measured device throughput. The word "bandwidth" appears
-once in the tree, in a harness `printf` reporting effective memory bandwidth.
+Tables are per-frame measured histograms, normalised to M=4096 and transmitted in the container.
+There is no profile library, no λ/Laplacian parameterisation, and no adjustment driven by channel
+bandwidth, buffer fullness or measured device throughput. The word "bandwidth" appears once in the
+tree, in a harness `printf` reporting effective memory bandwidth.
 
-This matters: a claim element requiring selection of a compression routine in dependence on a
-communication-channel parameter would find no corresponding structure or step here.
+A claim element requiring selection of a compression routine in dependence on a communication-channel
+parameter therefore has no corresponding structure or step here.
 
 ---
 
 ## 3. Prior-art matrix
 
-Functions mapped to public literature, with dates. "Pre-2014" marks material published before the
-task's stated boundary.
-
 | # | Function in this codebase | Public prior art | Date |
 |---|---|---|---|
-| 1 | 5/3 symmetric short-kernel subband filter bank | LeGall & Tabatabai, *Sub-band coding of digital images using symmetric short kernel filters and arithmetic coding techniques*, ICASSP | 1988 (pre-2014) |
-| 2 | Lifting factorisation of wavelet filters | Daubechies & Sweldens, *Factoring wavelet transforms into lifting steps*, J. Fourier Anal. Appl. 4(3) | 1998 (pre-2014) |
-| 3 | **Integer-to-integer** lifting with rounding (`>>` with offset terms) | Calderbank, Daubechies, Sweldens & Yeo, *Wavelet transforms that map integers to integers*, Appl. Comput. Harmon. Anal. 5(3) | 1998 (pre-2014) |
-| 4 | Reversible 5/3 with whole-sample symmetric extension, tile-independent decomposition | JPEG 2000, ISO/IEC 15444-1 / ITU-T T.800, Annex D & F | 2000–2002 (pre-2014) |
-| 5 | 5/3 integer lifting in a production intra codec with slices | SMPTE ST 2042-1 (VC-2) | 2008 (pre-2014) |
-| 6 | Band/slice-independent wavelet decomposition (restart at slice boundary) | Dirac specification (BBC), public | 2004–2008 (pre-2014) |
-| 7 | 32-lane warp prefix scan (`__shfl_up` Hillis-Steele) | Hillis & Steele, *Data parallel algorithms*, CACM 29(12); Kogge & Stone | 1986 / 1973 (pre-2014) |
-| 8 | Bitplane significance coding with per-group activity signalling | Taubman, *High performance scalable image compression with EBCOT*, IEEE TIP 9(7); Taubman & Marcellin, *JPEG2000* | 2000 / 2002 (pre-2014) |
-| 9 | Per-subband context partitioning of an entropy coder | EBCOT / JPEG 2000 as above; VC-2 | 2000–2008 (pre-2014) |
-| 10 | ANS/rANS: state, renormalisation, `[L, bL−1]` interval | Duda, *Asymmetric numeral systems*, **arXiv:0902.0271** (first version) | **2 Feb 2009** (pre-2014) |
-| 10a | Extended rANS formulation and interleaving | Duda, arXiv:1311.2540 | Nov 2013 (pre-2014) |
-| 11 | Byte-wise rANS with `x_max`, division encode, slot-table decode | Giesen, `ryg_rans` (public domain), README signed Feb 2014 | Feb 2014 |
-| 11a | Independent byte-rANS implementation in a production codec (CRAM) | Bonfield, `rans_static` in htslib | 2014 |
-| 12 | Slot/lookup-table rANS decode | as #11 | Feb 2014 |
-| 13 | Division by invariant integer via reciprocal multiply | Granlund & Montgomery, PLDI | 1994 (pre-2014) |
-| 14 | Interleaved multi-state rANS for ILP | Duda, arXiv:1311.2540 (describes interleaving) | Nov 2013 (pre-2014) |
-| 15 | Variable-length integer framing in a container header | general practice, decades old | pre-2014 |
+| 1 | 5/3 symmetric short-kernel subband filter bank | LeGall & Tabatabai, *Sub-band coding of digital images using symmetric short kernel filters and arithmetic coding techniques*, ICASSP | 1988 |
+| 2 | Lifting factorisation of wavelet filters | Daubechies & Sweldens, *Factoring wavelet transforms into lifting steps*, J. Fourier Anal. Appl. 4(3) | 1998 |
+| 3 | Integer-to-integer lifting with rounding (`>>` with offset terms) | Calderbank, Daubechies, Sweldens & Yeo, *Wavelet transforms that map integers to integers*, Appl. Comput. Harmon. Anal. 5(3) | 1998 |
+| 4 | Reversible 5/3 with whole-sample symmetric extension, tile-independent decomposition | JPEG 2000, ISO/IEC 15444-1 / ITU-T T.800, Annex D & F | 2000–2002 |
+| 5 | 5/3 integer lifting in a production intra codec with slices | SMPTE ST 2042-1 (VC-2) | 2008 |
+| 6 | Band/slice-independent wavelet decomposition (restart at slice boundary) | Dirac specification (BBC), public | 2004–2008 |
+| 7 | 32-lane warp prefix scan (`__shfl_up`, Hillis-Steele) | Hillis & Steele, *Data parallel algorithms*, CACM 29(12); Kogge & Stone | 1986 / 1973 |
+| 8 | Bitplane significance coding with per-group activity signalling | Taubman, *High performance scalable image compression with EBCOT*, IEEE TIP 9(7); Taubman & Marcellin, *JPEG2000* | 2000 / 2002 |
+| 9 | Per-subband context partitioning of an entropy coder | EBCOT / JPEG 2000 as above; VC-2 | 2000–2008 |
+| 10 | ANS/rANS: state, renormalisation, `[L, bL−1]` interval | Duda, *Asymmetric numeral systems*, arXiv:0902.0271 | Feb 2009 |
+| 11 | Extended rANS formulation and interleaving | Duda, arXiv:1311.2540 | Nov 2013 |
+| 12 | Byte-wise rANS with `x_max`, division encode, slot-table decode | Giesen, `ryg_rans` (public domain) | Feb 2014 |
+| 13 | Independent byte-rANS implementation in a production codec (CRAM) | Bonfield, `rans_static` in htslib | 2014 |
+| 14 | Division by invariant integer via reciprocal multiply | Granlund & Montgomery, PLDI | 1994 |
+| 15 | Variable-length integer framing in a container header | general practice | decades old |
 
-Two gaps to record honestly:
-- I did **not** identify specific prior art for the *combination* — warp-cooperative
-  desymbolisation with mask-derived bit positions (the `k_desym_w` design). It is a composition of
-  #7, #8 and #10; whether any claim covers that specific composition is exactly what a claim chart
-  would test, and I have no claim text to test it against.
-- The **slice-list-by-value batching** (`spr`, 32 slices in kernel arguments) is an ordinary
-  GPU-programming technique with no specific citation I can point to; it is very unlikely to be
-  anyone's claim element on its own.
+Two gaps:
 
----
+- No specific prior art was identified for the *combination* in `k_desym_w` — warp-cooperative
+  desymbolisation with mask-derived bit positions. It is a composition of #7, #8 and #10; whether
+  any claim covers that composition is what a claim chart would test.
+- The slice-list-by-value batching (`spr`, 32 slices in kernel arguments) is ordinary
+  GPU-programming technique with no specific citation. It is unlikely to be a claim element alone.
 
 ## 3.1 Chronological anchor
-
-The dates above, in order, are the whole prior-art story in one place:
 
 | Year | Anchor |
 |---|---|
@@ -143,41 +126,36 @@ The dates above, in order, are the whole prior-art story in one place:
 | 2013 | Duda, arXiv:1311.2540 — extended rANS, interleaving |
 | 2014 | Giesen, `ryg_rans` (Feb); Bonfield, `rans_static` in htslib |
 
-The two bold rows are the ones this codec actually rests on, and both predate every patent examined
-in §5 and §7 by between five and eight years.
-
-## 4. Patent numbers in the original brief were unusable — corrected set verified
-
-The numbers first supplied resolved, on Google Patents, to unrelated subject matter: US 10,129,552
-(video transcoding rate control), US 11,233,522 (image-sensor SAR ADC) and US 9,119,610 (an
-orthopaedic surgical table, Mizuho OSI). No claim chart was possible against them.
-
-A corrected list was supplied and **independently verified** here against Google Patents. All eight
-are real and on-topic. Two titles in the corrected list are slightly off, recorded so the register
-is accurate:
-
-| Number | Title of record | As described in the corrected list |
-|---|---|---|
-| US 11,234,023 B2 | Features of range asymmetric number system encoding and decoding | "Features of rANS encoding and decoding" — **matches** (RANS = range asymmetric number system) |
-| US 8,934,535 B2 | Systems and methods for video and audio data storage and distribution | matches |
-| US 8,867,610 B2 | System and methods for video and audio data distribution | matches |
-| US 7,415,530 B2 | System and methods for accelerated data storage and retrieval | matches |
-| US 8,378,862 B2 | Method and device for compression of binary sequences by grouping multiple symbols | described as "Efficient Data Compression" — **title differs** |
-| US 8,392,598 B2 | Methods and apparatus to facilitate client controlled sessionless adaptation | described as "Client-side bandwidth adaptation for streaming media" — **title differs in substance** |
-| US 8,832,297 B2 | Systems and methods for performing multiphase adaptive bitrate streaming | matches |
-| US 6,650,327 B1 | Display system having floating point rasterization and floating point framebuffering | matches; filed ~2000, expired |
+The bold rows are the two this codec rests on.
 
 ---
 
-## 5. Claim-level analysis of the two patents that bear on this codebase
+## 4. Patents examined
 
-Claims read from the granted text on Google Patents. Element-by-element mapping against source.
-This is a technical reading, not claim construction.
+Numbers, titles and dates as recorded on Google Patents; status and term as of the register.
+
+| Patent | Owner | Title of record | Filed | Status |
+|---|---|---|---|---|
+| US 11,234,023 B2 | Microsoft | Features of range asymmetric number system encoding and decoding | 2019-06-28 | Active, to 2039-06-28 |
+| US 8,934,535 B2 | Realtime Data | Systems and methods for video and audio data storage and distribution | 2002-02-13 | Expired — fee related |
+| US 8,867,610 B2 | Realtime Data | System and methods for video and audio data distribution | 2002-02-13 | Expired — fee related |
+| US 7,415,530 B2 | Realtime Data | System and methods for accelerated data storage and retrieval | 1999-03-11 | Expired — fee related |
+| US 8,378,862 B2 | Malikie Innovations | Method and device for compression of binary sequences by grouping multiple symbols | 2011-07-28 | Active, to 2031-10-13 |
+| US 8,392,598 B2 | Malikie Innovations | Methods and apparatus to facilitate client controlled sessionless adaptation | 2010-06-14 | Active, to 2031-05-29 |
+| US 8,832,297 B2 | DivX | Systems and methods for performing multiphase adaptive bitrate streaming | 2011-12-29 | Active, to 2031-12-29 |
+| US 6,650,327 B1 | Graphics Properties Holdings | Display system having floating point rasterization and floating point framebuffering | 1998-06-16 | Expired — lifetime |
+
+---
+
+## 5. Claim-level analysis
+
+Claims read from the granted text. Element-by-element mapping against source. This is a technical
+reading, not claim construction.
 
 ### 5.1 US 11,234,023 B2 (Microsoft) — rANS encoding/decoding
 
-Three independent claims (1 system, 19 method, 20 CRM), and **all three carry the same
-limitation**: a "two-phase structure for RANS decoding operations" in which
+Three independent claims (1 system, 19 method, 20 CRM), and all three carry the same limitation: a
+"two-phase structure for RANS decoding operations" in which
 
 1. the state update in phase one is *selective* and depends on "whether or not an output symbol
    from a previous iteration was generated", using probability information for the **previous**
@@ -197,21 +175,19 @@ while (x < RANS_L) x = (x<<8)|byte;              // DecRenorm
 
 `ref/codec.c:182-201`, `gpu/kernels.hi` (`k_dec`). The symbol is produced from the current state on
 every iteration; the update uses the *current* symbol's parameters; there is no threshold test
-gating generation and no previous-iteration predicate. This is the ordering published in
-`ryg_rans` (Giesen, Feb 2014), which post-dates Duda's ANS (arXiv:1311.2540, Nov 2013).
+gating generation and no previous-iteration predicate.
 
 **Distinguishing element: the two-phase deferred/predicated structure. Absent here.**
 
 The fragment-level features that would otherwise be uncomfortable — dependent claim 4's "syntax
 element that indicates whether or not the state ... is to be flushed and re-initialized" and
-"selection of a static probability model from among multiple available static probability models"
-— are exactly the kind of thing this codec does (per-stream independent 4-byte flush; per-stream
-table index). But claim 4 depends on claim 2, which depends on claim 1. **A dependent claim cannot
-be infringed without its independent claim.** That is the whole margin here, and it is worth
-recording plainly: the `fragment` concepts themselves are a close match to our design; the
-independent claims are saved only by the hardware two-phase pipelining limitation.
+"selection of a static probability model from among multiple available static probability models" —
+are close to what this codec does (per-stream independent 4-byte terminal state; per-stream table
+index). But claim 4 depends on claim 2, which depends on claim 1, and a dependent claim cannot be
+infringed without its independent claim. That is the whole margin: the fragment concepts themselves
+map closely; the independent claims are separated only by the two-phase pipelining limitation.
 
-### 5.2 US 8,934,535 B2 (Realtime Data) — the closest match in the set
+### 5.2 US 8,934,535 B2 (Realtime Data)
 
 Claim 1 recites: determining a parameter or attribute of at least a portion of a data block having
 audio or video data; **selecting an access profile from among a plurality of access profiles based
@@ -220,114 +196,84 @@ asymmetric data compression and information from the selected access profile, th
 being indicative of the one or more compressors to apply.
 
 Mapped against this tree: we determine an attribute of each portion (which subband and context a
-code-block belongs to), we select a compression configuration on that basis (one of 64
-per-subband/per-context distributions), and we compress with rANS — an asymmetric coder. Three of
-four elements have counterparts.
+code-block belongs to), select a compression configuration on that basis (one of 64
+per-subband/per-context distributions), and compress with rANS, an asymmetric coder. Three of four
+elements have counterparts.
 
-**Correction to the brief's framing.** The instruction was to ensure "no dynamic throughput
-feedback". Claim 1 does not recite bandwidth, throughput or channel feedback at all — that element
-is in the specification and in sibling claims, not in claim 1. So the absence of a feedback loop
-here does **not** dispose of claim 1; it addresses something claim 1 does not require.
+Claim 1 does not recite bandwidth, throughput or channel feedback; those appear in the specification
+and in sibling claims, not in claim 1. The absence of a feedback path here therefore does not
+address claim 1.
 
 **The distinguishing element is compressor selection, not model derivation.** Claim 1 requires the
-selected profile to indicate *which of several compressors* to apply to the block. This codec has
-exactly one compressor — rANS — and what varies per subband is the probability model, which is
-*measured from the frame and transmitted*, not selected from a plurality of stored profiles. That
-is a real distinction, but it is argument, not a clean clearance, and it turns on how "access
-profile" and "compressor" are construed.
+selected profile to indicate *which of several compressors* to apply to the block. This codec has one
+compressor — rANS — and what varies per subband is the probability model, which is measured from the
+frame and transmitted, not selected from a plurality of stored profiles. That is argument rather
+than structural absence, and it turns on how "access profile" and "compressor" are construed.
 
-**This is the one item in the audit I would put in front of counsel.**
+This patent expired in 2022 (see §6); the analysis is recorded for the record.
 
-### 5.3 US 8,378,862 B2 (Malikie) — no counterpart
+### 5.3 US 8,378,862 B2 (Malikie)
 
 Claim 1 is a context-modelled **2^L-ary encoding tree** coder: select a 2^L-ary tree per context
-state, append length-L strings, traverse one level per string, and **update the context state based
-on the symbols**. This codec has no tree-structured variable-length coder and no adaptive context
-state updating during decode — tables are static per frame and rANS is arithmetic, not tree
-traversal. Our grouping of bits into 6-bit symbols is plain bit packing, not an L-ary tree walk.
+state, append length-L strings, traverse one level per string, and update the context state based on
+the symbols. This codec has no tree-structured variable-length coder and no adaptive context state
+updating during decode — tables are static per frame and rANS is arithmetic, not tree traversal.
+Grouping bits into 6-bit symbols is bit packing, not an L-ary tree walk.
 
-### 5.4 The remaining four — no structural counterpart
+### 5.4 The remaining four
 
-- **US 8,867,610** / **US 7,415,530** (Realtime Data, data distribution and accelerated storage):
-  storage/transmission architectures, no counterpart in an intra codec.
-- **US 8,392,598** (sessionless client-controlled adaptation) and **US 8,832,297** (multiphase
-  adaptive bitrate streaming): transport/ABR — this codec has no adaptive streaming control loop,
-  no client signalling and no bitrate ladder.
-- **US 6,650,327** (floating-point rasterisation/framebuffering, SGI/Graphics Properties Holdings):
-  GPU rasterisation. Nothing here touches texture pipelines; the codec never uses a graphics
-  pipeline abstraction. Also expired (filed ~2000).
+- US 8,867,610 and US 7,415,530 (Realtime Data, data distribution and accelerated storage):
+  storage and transmission architectures; no counterpart in an intra codec.
+- US 8,392,598 (sessionless client-controlled adaptation) and US 8,832,297 (multiphase adaptive
+  bitrate streaming): transport and ABR. This codec has no adaptive streaming control loop, no
+  client signalling and no bitrate ladder.
+- US 6,650,327 (floating-point rasterisation and framebuffering): GPU rasterisation. Nothing here
+  touches texture pipelines or any graphics pipeline abstraction.
 
 ---
 
-## 6. Litigation status, expiry, and the revised risk ranking
+## 6. Expiry and risk ranking
 
-Status and term taken from the register for every patent in the set. Expiry is decisive: a lapsed
-patent cannot be infringed under 35 U.S.C. § 271, and this codebase post-dates every expiry below,
-so no past-damages theory survives either.
+Four of the eight are expired: the three Realtime Data patents and the Graphics Properties Holdings
+patent. A lapsed patent cannot be infringed under 35 U.S.C. §271, and this codebase post-dates every
+expiry in the table, so no past-damages theory applies either.
 
-| Patent | Owner | Filed | Status | Term |
-|---|---|---|---|---|
-| US 8,934,535 B2 | Realtime Data | 2002-02-13 | **Expired — Fee Related** | would have run to 2022-02-13 |
-| US 8,867,610 B2 | Realtime Data | 2002-02-13 | **Expired — Fee Related** | 2022-02-13 |
-| US 7,415,530 B2 | Realtime Data | 1999-03-11 | **Expired — Fee Related** | 2019-03-11 |
-| US 6,650,327 B1 | Graphics Properties Holdings | 1998-06-16 | **Expired — Lifetime** | expired |
-| US 8,832,297 B2 | DivX / Fortress | 2011-12-29 | **Active** | to 2031-12-29 |
-| US 8,378,862 B2 | Malikie Innovations | 2011-07-28 | **Active** | to 2031-10-13 |
-| US 8,392,598 B2 | Malikie Innovations | 2010-06-14 | **Active** | to 2031-05-29 |
-| US 11,234,023 B2 | Microsoft | 2019-06-28 | **Active** | to 2039-06-28 |
-
-Two consequences, and the second is the one that matters:
-
-1. **The entire Realtime Data branch of the audit is dead.** All three patents, including the one
-   that read closest on the code (§5.2), expired or lapsed. The §5.2 analysis stands as reasoning
-   but is no longer load-bearing. Expiry clears the family, not just the one patent.
-2. **Four patents remain live, and for those the clearance rests on non-infringement alone** — not
-   on expiry. US 8,832,297, US 8,378,862 and US 8,392,598 run to 2031; US 11,234,023 to 2039.
-   Their §5 analyses found no counterpart to any claim element, which is the finding that has to
-   hold. Do not let the expiry of the Realtime Data group generalise into comfort about these.
-
-### Revised ranking
+Four remain live — US 11,234,023 to 2039; US 8,832,297, US 8,378,862 and US 8,392,598 to 2031. For
+those, the position rests on non-infringement alone, not on expiry: the §5 analyses found no
+counterpart to any claim element, and that is the finding that has to hold.
 
 | Rank | Item | Status | Basis |
 |---|---|---|---|
-| 1 | US 11,234,023 B2 (Microsoft), incl. dependent claims 2–4 | **Live to 2039** | Two-phase deferred/predicated emission absent from claims 1/19/20 (§5.1). Effective priority is **2019-06-28** with no earlier parent, so `ryg_rans` (Feb 2014) and Duda (Nov 2013) are §102 prior art by more than five years — non-infringement *and* invalidity anchors both hold. |
-| 2 | US 8,832,297 / 8,378,862 / 8,392,598 | **Live to 2031** | No counterpart to any claim element: no ABR ladder or client signalling; no 2^L-ary adaptive tree coder; no sessionless client adaptation (§5.4). |
-| 3 | Realtime Data family (8,934,535 / 8,867,610 / 7,415,530) | **Expired** | No exposure, §271. The §5.2 reasoning is retained for the record. |
-| 4 | US 6,650,327 | **Expired** | Rasterisation; expired. |
-| — | **intoPIX / JPEG XS estate** | **LIVE — see §7** | Not part of the brief's list and not cleared by any of the above. This is where the remaining exposure actually sits. |
+| 1 | US 11,234,023 B2, including dependent claims 2–4 | Live to 2039 | Two-phase deferred/predicated emission absent from claims 1/19/20 (§5.1). Effective priority is 2019-06-28 with no earlier parent, so `ryg_rans` (Feb 2014) and Duda (Nov 2013) are §102 prior art by more than five years: non-infringement and invalidity anchors both hold. |
+| 2 | US 8,832,297 / 8,378,862 / 8,392,598 | Live to 2031 | No counterpart to any claim element: no ABR ladder or client signalling; no 2^L-ary adaptive tree coder; no sessionless client adaptation (§5.4). |
+| 3 | Realtime Data family (8,934,535 / 8,867,610 / 7,415,530) | Expired | No exposure, §271. |
+| 4 | US 6,650,327 | Expired | Rasterisation; expired. |
+| — | intoPIX / JPEG XS estate (§7) | Live | FRAND-licensed, and architecturally the closest to this codec of anything examined. Not cleared by anything above. |
 
-**The headline is not "clear".** The patents in the brief are now accounted for — four expired, four
-live but without claim-element counterparts. But the commercially significant estate is the JPEG XS
-pool in §7, which is live, FRAND-licensed, and architecturally the closest thing to this codec of
-anything examined. A clean result on the brief's list does not carry over to it.
-
-To finish properly: the file histories (continuations, reexaminations, terminal disclaimers) for
-US 11,234,023, since it is live and its dependent claims map uncomfortably closely; and counsel's
-construction of "access profile" and "compressor" if the Realtime Data analysis is ever revived.
+The commercially significant estate is the JPEG XS pool in §7, not the patents in §4. A clear result
+on any of the above does not carry over to it.
 
 ---
 
 ## 7. JPEG XS / intoPIX estate, and the VC-2 lineage
 
-This codec is architecturally close to JPEG XS, which makes this the most commercially relevant
-section of the audit. Researched from primary sources: the licensors' own announcements, the
-patent register, and the published standard's implementations.
+This codec is architecturally close to JPEG XS. Researched from primary sources: the licensors' own
+announcements, the patent register, and implementations of the published standard.
 
 ### 7.1 The two estates
 
-- **JPEG XS has a live patent pool.** Fraunhofer IIS and intoPIX — described in the announcement
-  as "the main JPEG XS standard patent holders" — created a pool administered by Vectis IP
-  (joint licensing programme announced Feb 2021; pool available Mar 2022), licensed on FRAND
-  terms. So JXS-shaped implementations are not free of licensing exposure.
+- **JPEG XS has a live patent pool.** Fraunhofer IIS and intoPIX — described in the announcement as
+  "the main JPEG XS standard patent holders" — created a pool administered by Vectis IP (joint
+  licensing programme announced Feb 2021; pool available Mar 2022), licensed on FRAND terms.
 - **VC-2 is royalty-free.** BBC R&D describe VC-2 as "a royalty-free high-quality video codec",
   grown out of Dirac, specified in SMPTE ST 2042-1 (first edition 2008, revised 2017), with open
   reference and optimised implementations published by the BBC, and an IETF RTP payload format
   (RFC 8450).
 
-That asymmetry is exactly why the lineage argument matters: the same coding tools sourced to VC-2
-(2008, royalty-free) are prior art to intoPIX's filings; sourced to JPEG XS, they are licensed.
+The same coding tools sourced to VC-2 (2008, royalty-free) are prior art to intoPIX's filings;
+sourced to JPEG XS, they are licensed.
 
-### 7.2 Representative intoPIX filings (assignee query, verified)
+### 7.2 Representative intoPIX filings (assignee query)
 
 | Patent | Title | Priority |
 |---|---|---|
@@ -338,27 +284,26 @@ That asymmetry is exactly why the lineage argument matters: the same coding tool
 | EP 4,052,216 B1 | Image processor | 2019-10-30 |
 | EP 4,266,685 A1 | Video encoder comprising a frame buffer assembly | 2022-04-22 |
 
-### 7.3 The two claims that actually overlap
+### 7.3 The two claims that overlap
 
-**US 10,212,421 B2 (sign bit removal).** Claim 1 covers compressing coefficients into three
-outputs — a **magnitude** set, a **sign** set and a **metadata** set — by grouping coefficients,
-assigning each group a **gain factor**, computing each group's **Greatest Coded Line Index
-(GCLI)**, and copying magnitude bitplanes and sign bits according to a **quantisation level t**.
-Claim 3 adds "the de-correlative transform is a DWT 5/3 wavelet transform". On architecture, that
-is recognisably the same family as this codec: 5/3 transform, grouped coefficients, magnitude
-bitplanes, sign separable.
+**US 10,212,421 B2 (sign bit removal).** Claim 1 covers compressing coefficients into three outputs
+— a **magnitude** set, a **sign** set and a **metadata** set — by grouping coefficients, assigning
+each group a **gain factor**, computing each group's **Greatest Coded Line Index (GCLI)**, and
+copying magnitude bitplanes and sign bits according to a **quantisation level t**. Claim 3 adds "the
+de-correlative transform is a DWT 5/3 wavelet transform". On architecture that is the same family as
+this codec: 5/3 transform, grouped coefficients, magnitude bitplanes, sign separable.
 
-Its independent claim nonetheless requires three things this codec does not have: **per-group gain
-factors**, **GCLI index metadata**, and a **quantisation level t** (with the right-shift-by-t that
-implies, and transmission of t). This codec is arithmetic-lossless, has no per-group gain, no GCLI,
-and transmits no quantisation level. **Distinguishing elements: gain, GCLI, t — all absent.**
+Its independent claim nonetheless requires three things this codec does not have: per-group gain
+factors, GCLI index metadata, and a quantisation level t (with the right-shift-by-t that implies,
+and transmission of t). This codec is arithmetic-lossless, has no per-group gain, no GCLI, and
+transmits no quantisation level. **Distinguishing elements: gain, GCLI, t — all absent.**
 
 **EP 3,556,097 B1 (subband-dependent GCLI prediction).** Claim 1 recites a **precinct** spanning
 coefficients from two subbands over a spatial region, computing GCLI per group, and encoding the
-GCLI of one subband in a first mode and the other in a second, the modes being **vertical
-prediction, horizontal prediction or raw**. This codec has no precinct, no GCLI, and no
-prediction-mode selection — its per-subband variation is a *measured rANS probability table*, not a
-predicted GCLI. **No counterpart to any element of the claim's distinguishing structure.**
+GCLI of one subband in a first mode and the other in a second, the modes being vertical prediction,
+horizontal prediction or raw. This codec has no precinct, no GCLI, and no prediction-mode selection
+— its per-subband variation is a measured rANS probability table, not a predicted GCLI. **No
+counterpart to any element of the claim's distinguishing structure.**
 
 ### 7.4 VC-2 lineage — every shared tool traced to the standard
 
@@ -366,46 +311,51 @@ predicted GCLI. **No counterpart to any element of the claim's distinguishing st
 |---|---|---|
 | 5/3 reversible integer lifting | VC-2 defines the 5/3 filter with a configurable wavelet depth | ST 2042-1:2008; Dirac spec; `vc2enc.c` `wavelet_depth`, `wavelet_idx` |
 | Analysis into per-(level, orientation) subbands | Subband split per level and orientation, coded per subband | BBC `split_into_subbands()`; `vc2enc.c` loop over `level`, `orientation` with `quant[level][orientation]` |
-| **Slicing: horizontal strip, independently coded, transform restarted at the boundary** | VC-2 slices are horizontal strips with per-slice byte allocation and independent decodability | BBC `Slices.cpp` — `slice_bytes()`, `component_slice_bytes()`, `slice_prefix`, `suggestSliceSize()`; `vc2enc.c` `encode_slice_params()` |
-| **Magnitude coded, sign carried separately, sign only when magnitude non-zero** | VC-2 codes an unsigned exp-Golomb magnitude and then, if non-zero, a single sign bit | `vc2enc.c` `encode_subband()`: `put_vc2_ue_uint_inline(pb, c_abs); if (c_abs) put_bits(pb, 1, coeff[x] < 0);` |
-| Group/code-block independent parallel coding | Slices are independently decodable units, enabling parallel and low-latency operation | ST 2042-1 slice structure; `suggestSliceSize()` |
+| Slicing: horizontal strip, independently coded, transform restarted at the boundary | VC-2 slices are horizontal strips with per-slice byte allocation and independent decodability | BBC `Slices.cpp` — `slice_bytes()`, `component_slice_bytes()`, `slice_prefix`, `suggestSliceSize()`; `vc2enc.c` `encode_slice_params()` |
+| Magnitude coded, sign carried separately, sign only when magnitude non-zero | VC-2 codes an unsigned exp-Golomb magnitude and then, if non-zero, a single sign bit | `vc2enc.c` `encode_subband()`: `put_vc2_ue_uint_inline(pb, c_abs); if (c_abs) put_bits(pb, 1, coeff[x] < 0);` |
+| Group/code-block independent parallel coding | Slices are independently decodable units | ST 2042-1 slice structure; `suggestSliceSize()` |
 | Per-band parameterisation of the coder | Per-(level, orientation) quantisation parameters | `quant[level][orientation]`; `encode_quant_matrix()` |
 
-On this evidence the **architecture is claimable from VC-2**: 5/3 lifting, slice-independent
-transform restart, per-subband handling, and magnitude-with-separate-sign coding are all disclosed
-in a royalty-free published standard five to eight years before the intoPIX filings above. The
-separate *sign stream* is further anticipated by sign coding as a distinct element in EZW (Shapiro,
-1993) and EBCOT/JPEG 2000 (2000).
+On this evidence the architecture is claimable from VC-2: 5/3 lifting, slice-independent transform
+restart, per-subband handling, and magnitude-with-separate-sign coding are disclosed in a
+royalty-free published standard five to eight years before the intoPIX filings above. The separate
+sign stream is further anticipated by sign coding as a distinct element in EZW (Shapiro, 1993) and
+EBCOT/JPEG 2000 (2000).
 
-Version caveat: the prior-art date relied on is the **2008 first edition** of ST 2042-1 and the
-public Dirac specification before it. Everything in the table above is Dirac-core functionality
-present from the outset, not a tool added in the 2017 revision — but if any element were ever
-traced to a post-2016 addition, it would stop being prior art to the 2016 filings and the argument
-would have to be re-based.
+Version caveat: the prior-art date relied on is the 2008 first edition of ST 2042-1 and the public
+Dirac specification before it. Everything in the table is Dirac-core functionality present from the
+outset, not a tool added in the 2017 revision. If any element were traced to a post-2016 addition it
+would stop being prior art to the 2016 filings, and the argument would have to be re-based.
 
-### 7.5 What is genuinely NOT traceable to VC-2
+### 7.5 What is not traceable to VC-2
 
-Three things, stated plainly rather than folded into the lineage claim:
-
-1. **rANS.** VC-2 uses exp-Golomb VLC coding, not rANS. Ours comes from Duda (arXiv:1311.2540,
-   Nov 2013) and ryg_rans (Giesen, Feb 2014). This postdates VC-2 by five years — but it
-   **predates all four intoPIX filings that matter** (2016-12, 2017-07, 2019-10), so it is prior
-   art against them rather than a gap in our position. It will not help against the 2013-03 filing
-   (US 9,332,258, display stream compression), though that patent's subject is display stream
-   compression rather than wavelet entropy coding.
-2. **Per-context measured, transmitted probability tables.** VC-2 parameterises per subband but
-   does not transmit per-context entropy models. Closest prior art is EBCOT's per-subband context
+1. **rANS.** VC-2 uses exp-Golomb VLC coding, not rANS. Ours comes from Duda (arXiv:0902.0271, 2009;
+   arXiv:1311.2540, 2013) and `ryg_rans` (Giesen, Feb 2014). This postdates VC-2 by five years but
+   predates all four intoPIX filings that matter (2016-12, 2017-07, 2019-10), so it is prior art
+   against them rather than a gap. It does not help against the 2013-03 filing (US 9,332,258), whose
+   subject is display stream compression rather than wavelet entropy coding.
+2. **Per-context measured, transmitted probability tables.** VC-2 parameterises per subband but does
+   not transmit per-context entropy models. Closest prior art is EBCOT's per-subband context
    modelling (2000) and CABAC's context modelling (2003); no exact match identified.
 3. **Warp-cooperative desymbolisation** (mask-derived bit positions, one warp per code-block). No
-   VC-2 counterpart and no patent found; it appears to be original engineering here.
+   VC-2 counterpart and no patent found.
 
-### 7.6 Practical consequence
+### 7.6 Constraint on further work
 
-- Keep the lineage written down — this file is the record — and cite VC-2/Dirac, Duda and ryg_rans
-  in the README rather than describing the design in JPEG XS vocabulary.
-- **Do not adopt the JXS-specific tools when chasing further rate gains.** Precincts, GCLI
-  prediction modes, and per-group gain/quantisation-level machinery are precisely the elements the
-  intoPIX claims recite, and precisely the elements this codec currently does not have. The
-  section 7.3 analysis is only clean because they are absent.
-- Further rate work should therefore stay on the safe side of that line: better probability
-  modelling and context selection, not JXS's coefficient-length machinery.
+- Cite VC-2/Dirac, Duda and `ryg_rans` in the README, and describe the design in those terms rather
+  than in JPEG XS vocabulary.
+- Do not adopt the JXS-specific tools when chasing rate: precincts, GCLI prediction modes, and
+  per-group gain/quantisation-level machinery are the elements the intoPIX claims recite, and the
+  elements this codec does not have. The §7.3 analysis is clean because they are absent.
+- Further rate work stays on the safe side of that line: better probability modelling and context
+  selection, not coefficient-length machinery.
+
+---
+
+## 8. Outstanding
+
+- File histories for US 11,234,023 — continuations, reexaminations, terminal disclaimers — since its
+  dependent claims 2–4 map closely to the per-stream terminal state and table selection here.
+- Priority dates for US 10,212,421 and EP 3,556,097 confirmed against the register, and their file
+  histories, before relying on the §7.3 distinctions.
+- Counsel's construction of "access profile" and "compressor" if US 8,934,535 is ever revived.
