@@ -1,0 +1,4 @@
+build/
+*.o
+ref/codec_test
+ref/test_wavelet
