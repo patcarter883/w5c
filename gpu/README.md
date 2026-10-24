@@ -88,9 +88,9 @@ Two changes followed, worth 8-10x between them:
    into the frame, it costs what it should. At *identical* rate (blk=64, 5.338 bpp) this alone
    took the frame from 84.5/98.4 ms to 30.5/35.2 ms.
 
-### What moved the needle, and what did not
+### Measured changes
 
-Three attempts, in order of size, all measured:
+Three changes, in order of size:
 
 1. **Row-pointer walks** — one address add per row instead of a 64-bit multiply per
    coefficient. 10.17 -> 9.66 ms encode, decode unchanged. Kept (cleaner, helps at blk=16),
@@ -189,7 +189,7 @@ rather than a global transpose.
 Effective bandwidth at 1080p is ~17 GB/s, which is low for the hardware: one work-group per
 line gives coarse axial parallelism and 256 threads iterating a 1920-element line. It does not
 matter here (the transform is ~0.03% of the codec budget) but it is why this is not a
-300 GB/s kernel — a warp-per-line tiling would be the fix if it ever mattered.
+300 GB/s kernel — a warp-per-line tiling would be the fix.
 
 Floor is ~0.4 ms across all sizes: 10 kernel launches of overhead. Irrelevant at HD/4K,
 dominant below ~320×240.
@@ -284,8 +284,7 @@ Both directions now run entirely on the GPU; the host only orchestrates and copi
 **Desymbolise is now the largest single stage** (15.7–19.4 ms) because it is one thread per
 code-block — 609 work-items at 1080p, which is even more starved than the symboliser was. Note
 it was 30.1 ms until I replaced the per-coefficient `i / bw` / `i % bw` with an incrementing
-cursor: an integer division in that inner loop cost 2x. The remaining parallelism is genuinely
-harder here, because the walk is sequential within a block by construction.
+cursor: an integer division in that inner loop cost 2x. The remaining parallelism is harder here, because the walk is sequential within a block by construction.
 
 ## Head-to-head: VC-2, SVT-JPEG-XS, DNxHR, FFV1
 
@@ -311,28 +310,26 @@ SVT-JPEG-XS at 1.0 bpp — while remaining lossless.
 > superseded by the current **5.460 bpp, 6.2 ms encode, 3.4 ms decode** in the MVP section above.
 > The rows for the other codecs are unaffected. Kept as measured rather than silently restated.
 
-### What this actually says
+### Reading the comparison
 
-Conclusions drawn from the run above: the rank ordering still holds, though the absolute figures
-for this codec have since moved (see the note above).
+These conclusions come from the run above. The rank ordering holds; the absolute figures for this
+codec have since moved (see the note above).
 
-1. **Speed: the GPU is now paying for itself.** 10.17 ms encode against FFV1's 31.16 ms on the
-   CPU — 3.1x faster than the only true-lossless peer here, and faster than VC-2 (12.43) and
-   DNxHR HQX (33.36) as well. SVT-JPEG-XS is still quicker (9.12-10.71 ms) but it is lossy at
-   1.0-1.5 bpp; it is not the same trade.
-2. **Rate: still 19% worse than FFV1** (5.644 vs 4.729 bpp) — the cost of the smaller
+1. **Speed.** 10.17 ms encode against FFV1's 31.16 ms on the CPU: 3.1x faster than the other
+   lossless codec here, and faster than VC-2 (12.43 ms) and DNxHR HQX (33.36 ms). SVT-JPEG-XS is
+   faster (9.12-10.71 ms) at 1.0-1.5 bpp and is lossy.
+2. **Rate.** 19% worse than FFV1 in this run (5.644 vs 4.729 bpp): the cost of the smaller
    code-blocks plus no context modelling beyond symbol packing. At blk=64 the gap is 13%
-   (5.338 bpp) but the frame costs 30.5/35.2 ms. That trade is now a knob, not a fixed property.
-3. **SVT-JPEG-XS is still the bar for a mezzanine codec**: 40.4-43.4 dB at 1.0-1.5 bpp in under
-   11 ms. Matching that *and* staying lossless is not a tuning problem; it needs context
-   modelling (rate) and warp-cooperative symbolisation (speed).
-4. **The VC-2 row is unflattering to VC-2, not to this codec**: ffmpeg's encoder needs 4.809 bpp
-   to reach 31.8 dB, which is a basic encoder, not a fair picture of VC-2's potential. Note the
-   comparison is against *ffmpeg's* VC-2, not a tuned implementation.
+   (5.338 bpp) and the frame costs 30.5/35.2 ms.
+3. **SVT-JPEG-XS.** 40.4-43.4 dB at 1.0-1.5 bpp in under 11 ms. Matching that while remaining
+   lossless requires context modelling for rate and warp-cooperative symbolisation for speed.
+4. **The VC-2 row is ffmpeg's encoder.** It needs 4.809 bpp to reach 31.8 dB. It is a basic
+   encoder rather than a tuned VC-2 implementation, so the row measures ffmpeg, not VC-2's
+   capability.
 
-### Measurement notes (the numbers moved a lot, here is why)
+### Measurement notes
 
-- The card was genuinely idle for these runs (0% use, no KFD processes), having earlier been
+- The card was idle for these runs (0% use, no KFD processes), having earlier been
   shared with two inference tenants.
 - A *single* pipeline run is not a valid measurement: the same input measured 44.3 ms once and
   52.7 ms on the next run. Eight back-to-back runs converge to 52.1-52.9 ms, so the harness

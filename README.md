@@ -5,8 +5,7 @@ and rANS entropy coding, written in HIP for AMD GPUs and verified bit-exact agai
 reference implementation.
 
 w5c is its own codec, inspired by VC-2: the wavelet arithmetic survives, and the serial entropy stage
-is replaced with a frame's worth of independent rANS streams. It is roughly what VC-2 could have
-become if it had been designed with a modern GPU available.
+is replaced with a frame's worth of independent rANS streams.
 
 **Status: MVP.** Lossless only. One frame at a time. No rate control, no muxing, no audio, no
 colour conversion.
@@ -22,13 +21,11 @@ colour conversion.
 | 16 | 3,122,032 | 6.022 | 7.2 ms | 4.7 ms |
 | 8 | 4,282,139 | 8.260 | 4.8 ms | 5.9 ms |
 
-All rows bit-exact. `blk` is the speed/rate knob and the most consequential parameter in the codec:
-code-blocks *are* the work items, so block size is parallelism, and it trades directly against rate.
+All rows bit-exact. `blk` trades rate against parallelism: code-blocks are the work items, so block
+size sets how many independent streams exist.
 
-For scale, on the same 1080p 4:2:2 source: FFV1 level 3 runs 4.729 bpp at ~31 ms/frame on the CPU,
-so this is roughly 12–15% larger depending on block size, and about 5x faster. SVT-JPEG-XS reaches
-40–43 dB at 1.0–1.5 bpp in ~9–11 ms — lossy at a fraction of the rate, and the real bar for a
-mezzanine codec.
+On the same 1080p 4:2:2 source, FFV1 level 3 runs 4.729 bpp at ~31 ms/frame on the CPU. SVT-JPEG-XS
+reaches 40–43 dB at 1.0–1.5 bpp in ~9–11 ms.
 
 ## How it works
 
@@ -41,10 +38,9 @@ mezzanine codec.
 - **Orchestration.** Every plane of a frame passes through each stage in a single kernel launch. The
   launch sequence exists in exactly one place and is shared by the CLI and the validation harness.
 
-The scarce resource is concurrent entropy streams, not arithmetic. A 5/3 pass is adds and shifts and
-rANS is a dependent chain per stream, so the design is stream-parallel rather than wide-vector. At
-1080p with 32x32 blocks there are ~17k streams, which is right at the point where the card's entropy
-throughput saturates.
+Throughput is bounded by concurrent entropy streams rather than arithmetic: a 5/3 pass is adds and
+shifts, and rANS is a dependent chain per stream. The stream count at which throughput stops rising
+is around 16k; 1080p with 32x32 blocks produces ~17k.
 
 ## Build
 
@@ -88,22 +84,21 @@ transform restart, per-subband coding, and magnitude carried separately from sig
 is our own choice of **rANS** — Duda (arXiv:0902.0271, 2009; arXiv:1311.2540, 2013) and Giesen's
 `ryg_rans` (2014). The warp-cooperative desymboliser is original to this project.
 
-This matters because JPEG XS has a live FRAND patent pool (Fraunhofer IIS and intoPIX, via Vectis
-IP) while VC-2 is royalty-free, and an implementation this shape is close enough to JPEG XS for the
-lineage to be worth documenting. `IP_AUDIT.md` records the claim-boundary analysis in full, including
-the coding tools **deliberately not implemented** — precincts, GCLI prediction modes, per-group gain
-factors, quantisation-level machinery — because live third-party claims recite them. Read §7 before
-adding a coding tool.
+JPEG XS has a live FRAND patent pool (Fraunhofer IIS and intoPIX, via Vectis IP); VC-2 is
+royalty-free. `IP_AUDIT.md` records the claim-boundary analysis in full, including the coding tools
+**deliberately not implemented** — precincts, GCLI prediction modes, per-group gain factors,
+quantisation-level machinery — because live third-party claims recite them. Read §7 before adding a
+coding tool.
 
 Apache-2.0; see `LICENSE`. Contributions require DCO sign-off; see `CONTRIBUTING.md`.
 
 ## Limits
 
 - **Lossless only.** There is no lossy mode and no quantiser.
-- **Rate is worse than FFV1** by 12–15%. The time advantage is real; the compression advantage is not.
-- **Timings are content-dependent.** Real camera frames cost notably more than synthetic content
-  because they carry more significant coefficients. Figures above are steady state, best-of-N, on an
-  idle card.
+- **Rate is worse than FFV1** by 12–15%.
+- **Timings are content-dependent.** Real camera frames cost more than synthetic content because
+  they carry more significant coefficients. Figures above are steady state, best-of-N, on an idle
+  card.
 - **No CI yet.** The test suite is a local script; nothing currently guards a pull request against
   breaking bit-exactness.
 
@@ -121,7 +116,7 @@ IP_AUDIT.md   prior art, claim-boundary analysis, do-not-adopt list
 ## Where the detail is
 
 - **`SPEC.md`** — the bitstream, normative, independent of the implementation.
-- **`gpu/README.md`** — the measured story: which optimisations paid, which did not, and why.
+- **`gpu/README.md`** — per-stage measurements, including optimisations that were tried and reverted.
 - **`IP_AUDIT.md`** — provenance, claim boundaries, and what not to implement.
 - **`docs/microarchitecture.md`** — why it is shaped this way on RDNA.
 - **`docs/rANS_formulation.md`** — the entropy state machine and its trade-offs.
