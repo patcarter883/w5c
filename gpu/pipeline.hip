@@ -65,7 +65,7 @@ static bool plane_geometry(int w, int h, int levels, int blk, plane_geom *g)
 
 /* --------------------------------------------------------------- encode */
 static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
-                             std::vector<uint8_t> &out, stage_ms *sm, int slice_h, int wav)
+                             std::vector<uint8_t> &out, stage_ms *sm, int slice_h)
 {
     stage_ms z = {0, 0, 0, 0, 0, 0, 0, 0};
     if (sm) *sm = z;
@@ -258,7 +258,7 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     auto put32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t *)&v, (uint8_t *)&v + 4); };
     put32(W5C_MAGIC); put32((uint32_t)np); put32((uint32_t)levels);
     put32((uint32_t)nb_total); put32((uint32_t)ns_total); put32((uint32_t)ntab);
-    put32((uint32_t)blk); put32((uint32_t)((slice_h & 0xFFFF) | ((wav & 0xFFFF) << 16)));
+    put32((uint32_t)blk); put32((uint32_t)(slice_h > 0 ? slice_h : 0));
     for (int i = 0; i < np; i++) { put32((uint32_t)P[i].w); put32((uint32_t)P[i].h); }
     out.insert(out.end(), (uint8_t *)freqs.data(), (uint8_t *)freqs.data() + freqs.size() * 2);
     for (int i = 0; i < nb_total; i++) out.push_back((uint8_t)bds[i].mb);
@@ -308,7 +308,7 @@ static bool w5c_payload_span(const uint8_t *in, size_t inlen, size_t *off, size_
 /* --------------------------------------------------------------- decode */
 /* Reads the header so the caller can allocate the planes before decoding. */
 static bool gpu_frame_dims(const uint8_t *in, size_t inlen, plane_t *P, int *np_out,
-                           int *levels, int *blk, int *slice_h, int *wav)
+                           int *levels, int *blk, int *slice_h)
 {
     if (inlen < 32) return false;
     const uint32_t *h = (const uint32_t *)in;
@@ -318,7 +318,7 @@ static bool gpu_frame_dims(const uint8_t *in, size_t inlen, plane_t *P, int *np_
     if (inlen < 32 + (size_t)np * 8) return false;
     for (int i = 0; i < np; i++) { P[i].w = (int)h[8 + i * 2]; P[i].h = (int)h[9 + i * 2]; }
     *np_out = np; *levels = (int)h[2]; *blk = (int)h[6];
-    *slice_h = (int)(h[7] & 0xFFFFu); *wav = (int)(h[7] >> 16);
+    *slice_h = (int)h[7];
     return true;
 }
 
@@ -329,7 +329,7 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     if (h32[0] != W5C_MAGIC) return false;
     int hnp = (int)h32[1], levels = (int)h32[2];
     int nb_total = (int)h32[3], ns_total = (int)h32[4], ntab = (int)h32[5], blk = (int)h32[6];
-    int slice_h = (int)(h32[7] & 0xFFFFu), wav = (int)(h32[7] >> 16);
+    int slice_h = (int)h32[7];
     if (hnp != np || np < 1 || np > W5C_MAXPLANES) return false;
 
     size_t p = 32 + (size_t)np * 8;
@@ -474,7 +474,7 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
    passed by value, so the per-slice restart costs no extra dispatch. */
 static void split_launch(bool fwd, const int16_t *src, int16_t *dst, long y0_step,
                          long line_pitch, long stride, int posmajor,
-                         const spr &sp, int ns, int wav)
+                         const spr &sp, int ns)
 {
     if (ns <= 0) return;
     long most = 0;
@@ -485,24 +485,8 @@ static void split_launch(bool fwd, const int16_t *src, int16_t *dst, long y0_ste
     }
     if (most <= 0) return;
     dim3 grid((unsigned)((most + 255) / 256), (unsigned)ns);
-    if (fwd) k_dwt_fwd_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns, wav);
-    else     k_dwt_inv_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns, wav);
-}
-
-static void split_launch_odd(const int16_t *src, int16_t *dst, int y0_step,
-                             int line_pitch, int stride, int posmajor,
-                             const spr &sp, int ns, int wav)
-{
-    if (ns <= 0) return;
-    long most = 0;
-    for (int i = 0; i < ns; i++) {
-        int n = sp.n[i], nl = sp.nl[i];
-        long t = posmajor ? (long)nl * n : (long)nl * ((n + 1) / 2);
-        if (t > most) most = t;
-    }
-    if (most <= 0) return;
-    dim3 grid((unsigned)((most + 255) / 256), (unsigned)ns);
-    k_dwt_inv_odd_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns, wav);
+    if (fwd) k_dwt_fwd_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns);
+    else     k_dwt_inv_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns);
 }
 
 /* Forward / inverse transform, slice by slice.
@@ -515,7 +499,7 @@ static void split_launch_odd(const int16_t *src, int16_t *dst, int y0_step,
 
    Everything runs on the default stream; per-plane streams were tried and measured as no help,
    and non-blocking streams raced the upload that feeds them. */
-static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, int slice_h, int wav)
+static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, int slice_h)
 {
     static int16_t *scr[W5C_MAXPLANES];
     static size_t scrn[W5C_MAXPLANES];
@@ -556,14 +540,12 @@ static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, i
             }
             (void)cw;
             if (fwd) {
-                split_launch(true, P[k].d, scr[k], (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
-                split_launch(true, scr[k], P[k].d, (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
+                split_launch(true, P[k].d, scr[k], (long)P[k].w, (long)P[k].w, 1, 1, rows, ns);
+                split_launch(true, scr[k], P[k].d, (long)P[k].w, 1, (long)P[k].w, 0, cols, ns);
             } else {
                 /* columns first, then rows, undoing the forward order */
-                split_launch(false, P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
-                if (wav) split_launch_odd(P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
-                split_launch(false, scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
-                if (wav) split_launch_odd(scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
+                split_launch(false, P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns);
+                split_launch(false, scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns);
             }
         }
     }

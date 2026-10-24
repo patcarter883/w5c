@@ -61,7 +61,7 @@ int main(int argc, char **argv)
         HIPCHECK(hipMalloc(&d, npx * 2));
         HIPCHECK(hipMemcpy(d, img.data(), npx * 2, hipMemcpyHostToDevice));
         plane_t PT[1] = {{d, w, h}};
-        plane_dwt_all(PT, 1, levels, true, nullptr, 0, 0);
+        plane_dwt_all(PT, 1, levels, true, nullptr, 0);
         HIPCHECK(hipGetLastError());
         HIPCHECK(hipMemcpy(coef.data(), d, npx * 2, hipMemcpyDeviceToHost));
         hipFree(d);
