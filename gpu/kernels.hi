@@ -285,6 +285,7 @@ struct sdesc {
     int tab;        /* subband*4 + ctx */
     int16_t *pl;    /* the plane this block lives in */
     int pw;         /* that plane's row stride */
+    int bi;         /* block index, for the shared newly-significant flags */
 };
 
 __device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x0, int cx, int cy)
@@ -293,6 +294,7 @@ __device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x
 }
 
 __global__ void k_sym(const sdesc * __restrict__ d,
+                      const uint32_t * __restrict__ nw,
                       uint8_t * __restrict__ out,
                       const uint32_t * __restrict__ boff,
                       uint32_t * __restrict__ nbits,
@@ -316,6 +318,10 @@ __global__ void k_sym(const sdesc * __restrict__ d,
             const int16_t *row = base + (size_t)y * pw;
             for (int x = 0; x < bw; x++, i++) {
                 if ((i & 31) == 0) {
+                    if (nw) {
+                        /* shared per (block, plane) mask instead of a per-context rescan */
+                        newly = (int)((nw[sd.bi * 16 + p] >> (i >> 5)) & 1u);
+                    } else {
                     /* does any coefficient of this group become significant at p? */
                     newly = 0;
                     const int16_t *sr = row;
@@ -326,6 +332,7 @@ __global__ void k_sym(const sdesc * __restrict__ d,
                         int m = v < 0 ? -v : v;
                         if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
                         if (++sx == bw) { sx = 0; sr += pw; }
+                    }
                     }
                     if (ctx == 0) {
                         if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
@@ -501,6 +508,148 @@ __global__ void k_block_mb(bdesc * __restrict__ bd, int nblocks)
     int mb = 0;
     while (mx) { mb++; mx >>= 1; }
     bd[b].mb = mb;
+}
+
+/* One thread per (block, plane): the same scan the four context streams would each do for
+   themselves, done once and shared. Bit g of the mask says group g becomes significant here. */
+__global__ void k_newly(const bdesc * __restrict__ bd, int nblocks, uint32_t * __restrict__ nw)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = t >> 4, p = t & 15;
+    if (b >= nblocks) return;
+    bdesc d = bd[b];
+    if (p >= d.mb) { nw[b * 16 + p] = 0; return; }
+
+    int bw = d.bw, bh = d.bh, pw = d.pw;
+    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
+    uint32_t mask = 0;
+    int i = 0;
+    for (int y = 0; y < bh; y++) {
+        const int16_t *row = base + (size_t)y * pw;
+        for (int x = 0; x < bw; x++, i++) {
+            int m = row[x]; if (m < 0) m = -m;
+            if (!(m >> (p + 1)) && ((m >> p) & 1)) mask |= 1u << (i >> 5);
+        }
+    }
+    nw[b * 16 + p] = mask;
+}
+
+/* Warp scan over 32 lanes (exclusive result, total returned through *total). */
+__device__ __forceinline__ int warp_scan(int v, int lane, int *total)
+{
+    int incl = v;
+    for (int off = 1; off < 32; off <<= 1) {
+        int t = __shfl_up(incl, off, 32);
+        if (lane >= off) incl += t;
+    }
+    *total = __shfl(incl, 31, 32);
+    return incl - v;
+}
+
+/* One warp per code-block, one lane per 32-coefficient group.
+   Every bit position here is derived from a mask rather than a serial scan: the siggrp stream
+   takes exactly one bit per group per plane, so its position is analytic, and the sig, refine
+   and sign bases are warp prefix sums of per-group counts. Same bitstream as k_desym, decoded
+   32 lanes wide, so the serial length per block drops from coefficients x planes to
+   coefficients-per-group x planes. Blocks with more than 32 groups use k_desym. */
+__global__ void k_desym_w(const uint8_t * __restrict__ bits,
+                          const uint32_t * __restrict__ boff,
+                          const bdesc * __restrict__ bd, int nblocks)
+{
+    int tid  = blockIdx.x * blockDim.x + threadIdx.x;
+    int w    = tid >> 5;
+    int lane = tid & 31;
+    if (w >= nblocks) return;
+
+    bdesc d = bd[w];
+    int bw = d.bw, bh = d.bh, n = bw * bh, pw = d.pw;
+    int ng = (n + 31) / 32;
+    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
+
+    const uint8_t *stg = bits + boff[w * 4 + 0];
+    const uint8_t *sts = bits + boff[w * 4 + 1];
+    const uint8_t *stn = bits + boff[w * 4 + 2];
+    const uint8_t *str = bits + boff[w * 4 + 3];
+
+    int g = lane;
+    int have = (g < ng);
+    int start = g * 32;
+    int cnt = have ? (n - start < 32 ? n - start : 32) : 0;
+    int cy = have ? start / bw : 0;
+    int cx = have ? start - cy * bw : 0;
+
+    uint32_t sgnmask = 0;
+    size_t sig_head = 0, ref_head = 0, sgn_head = 0;
+
+    for (int p = d.mb - 1; p >= 0; p--) {
+        size_t gpos = (size_t)ng * (size_t)(d.mb - 1 - p) + (size_t)g;
+        int newly = have ? (int)((stg[gpos >> 3] >> (gpos & 7)) & 1) : 0;
+
+        /* classify my group: already significant, or newly significant at this plane */
+        uint32_t amask = 0, qmask = 0;
+        int csig = 0, cref = 0;
+        {
+            int16_t *rp = base + (size_t)cy * pw;
+            int tx = cx;
+            for (int k = 0; k < cnt; k++) {
+                int m = rp[tx]; if (m < 0) m = -m;
+                if (m >> (p + 1)) { amask |= 1u << k; cref++; }
+                else if (newly) { qmask |= 1u << k; csig++; }
+                if (++tx == bw) { tx = 0; rp += pw; }
+            }
+        }
+
+        int tsig, tref, tsgn;
+        int my_sig = warp_scan(csig, lane, &tsig);
+        int my_ref = warp_scan(cref, lane, &tref);
+        size_t pos_sig = sig_head + my_sig;
+        size_t pos_ref = ref_head + my_ref;
+
+        /* read refine and sig bits, write magnitudes, note which need a sign bit */
+        uint32_t smask = 0;
+        {
+            int16_t *rp = base + (size_t)cy * pw;
+            int tx = cx;
+            for (int k = 0; k < cnt; k++) {
+                int16_t *q = &rp[tx];
+                int m = *q; if (m < 0) m = -m;
+                if ((amask >> k) & 1u) {
+                    if ((str[pos_ref >> 3] >> (pos_ref & 7)) & 1) m |= (1 << p);
+                    pos_ref++;
+                    *q = (int16_t)m;
+                } else if ((qmask >> k) & 1u) {
+                    int sbit = (sts[pos_sig >> 3] >> (pos_sig & 7)) & 1;
+                    pos_sig++;
+                    if (sbit) { *q = (int16_t)(1 << p); smask |= 1u << k; }
+                }
+                if (++tx == bw) { tx = 0; rp += pw; }
+            }
+        }
+
+        int csgn = __popc(smask);
+        int my_sign = warp_scan(csgn, lane, &tsgn);
+        size_t pos_sign = sgn_head + my_sign;
+        if (csgn) {
+            for (int k = 0; k < cnt; k++)
+                if ((smask >> k) & 1u) {
+                    if ((stn[pos_sign >> 3] >> (pos_sign & 7)) & 1) sgnmask |= 1u << k;
+                    pos_sign++;
+                }
+        }
+
+        sig_head += (size_t)tsig;
+        ref_head += (size_t)tref;
+        sgn_head += (size_t)tsgn;
+    }
+
+    if (sgnmask) {
+        int16_t *rp = base + (size_t)cy * pw;
+        int tx = cx;
+        for (int k = 0; k < cnt; k++) {
+            if ((sgnmask >> k) & 1u) rp[tx] = (int16_t)(-rp[tx]);
+            if (++tx == bw) { tx = 0; rp += pw; }
+        }
+    }
 }
 
 /* One thread per code-block: the walk interleaves the four contexts, so it cannot be split

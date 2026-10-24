@@ -17,6 +17,7 @@
 #define W5C_PIPELINE_HIP
 
 #include "kernels.hi"
+#include <chrono>
 extern "C" {
 #include "wavelet.h"
 }
@@ -103,7 +104,7 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
                     sdesc &e = desc[bb * 4 + c];
                     e.x0 = d.x0; e.y0 = d.y0; e.bw = d.bw; e.bh = d.bh; e.mb = d.mb;
                     e.ctx = c; e.tab = g[i].bsub[b] * 4 + c;
-                    e.pl = P[i].d; e.pw = P[i].w;
+                    e.pl = P[i].d; e.pw = P[i].w; e.bi = bb;
                 }
             }
         }
@@ -133,8 +134,17 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
     float ms_sym = 0, ms_pack = 0, ms_hist = 0, ms_enc = 0;
 
+    /* group significance is shared by all four context streams; work it out once per
+       (block, plane). Masks are 32 bits, so this path needs at most 32 groups per block. */
+    uint32_t *d_nw = nullptr;
+    if (blk <= 32) {
+        HIPCHECK(hipMalloc(&d_nw, (size_t)nb_total * 16 * 4));
+        k_newly<<<(nb_total * 16 + 127) / 128, 128>>>(d_bd, nb_total, d_nw);
+        HIPCHECK(hipGetLastError());
+    }
+
     HIPCHECK(hipEventRecord(e0));
-    k_sym<<<nbs, 128>>>(d_desc, d_bits, d_boff, d_nb, ns_total, 1);
+    k_sym<<<nbs, 128>>>(d_desc, d_nw, d_bits, d_boff, d_nb, ns_total, 1);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());
@@ -230,7 +240,7 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     for (int i = 0; i < ns_total; i++)
         out.insert(out.end(), encbuf.data() + ooff[i], encbuf.data() + ooff[i] + olen[i]);
 
-    (void)hipFree(d_bd); (void)hipFree(d_desc); (void)hipFree(d_bits); (void)hipFree(d_boff); (void)hipFree(d_nb);
+    (void)hipFree(d_bd); (void)hipFree(d_nw); (void)hipFree(d_desc); (void)hipFree(d_bits); (void)hipFree(d_boff); (void)hipFree(d_nb);
     (void)hipFree(d_sym); (void)hipFree(d_so); (void)hipFree(d_nso); (void)hipFree(d_stab);
     (void)hipFree(d_hist); (void)hipFree(d_pool); (void)hipFree(d_freq);
     (void)hipFree(d_out); (void)hipFree(d_cap); (void)hipFree(d_ooff); (void)hipFree(d_olen);
@@ -370,7 +380,10 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
 
     HIPCHECK(hipEventRecord(e0));
     k_unpack<<<nbs, 128>>>(d_syms, d_so, d_sl, d_bits2, d_b2off, ns_total);
-    if (blk <= 32)
+    /* W5C_DESYM_OLD=1 forces the one-thread-per-block walk, for A/B validation */
+    if (blk <= 32 && !getenv("W5C_DESYM_OLD"))
+        k_desym_w<<<(nb_total + 3) / 4, 128>>>(d_bits2, d_b2off, d_bd, nb_total);
+    else if (blk <= 32)
         k_desym<1024><<<(nb_total + 127) / 128, 128>>>(d_bits2, d_b2off, d_bd, nb_total);
     else
         k_desym<4096><<<(nb_total + 127) / 128, 128>>>(d_bits2, d_b2off, d_bd, nb_total);
@@ -388,31 +401,38 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     return true;
 }
 
-/* forward / inverse transform for one plane */
-static void plane_dwt(int16_t *d_plane, int w, int h, int levels, bool fwd, float *ms)
+/* Forward / inverse transform for a whole set of planes.
+
+   Each level is two dependent launches, so one plane's chain is 10 launches that cannot overlap
+   with themselves: the transform measured 0.31 ms of GPU work but 1.95 ms of wall time. Planes
+   are independent of each other, so they go on separate streams and fill each other's gaps. */
+static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms)
 {
-    int cw[16], ch[16];
-    int nl = level_sizes(w, h, levels, cw, ch);
-    hipEvent_t e0, e1;
-    HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
-    HIPCHECK(hipDeviceSynchronize());
-    HIPCHECK(hipEventRecord(e0));
-    for (int L = 0; L < nl; L++) {
-        int i = fwd ? L : nl - 1 - L;
-        if (fwd) {
-            k_lift1d_fwd<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2>>>(d_plane, 0, (long)w, 1, cw[i]);
-            k_lift1d_fwd<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2>>>(d_plane, 0, 1, (long)w, ch[i]);
-        } else {
-            k_lift1d_inv<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2>>>(d_plane, 0, 1, (long)w, ch[i]);
-            k_lift1d_inv<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2>>>(d_plane, 0, (long)w, 1, cw[i]);
+    static hipStream_t st[W5C_MAXPLANES];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < W5C_MAXPLANES; i++) HIPCHECK(hipStreamCreate(&st[i]));
+        init = true;
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int k = 0; k < np; k++) {
+        int cw[16], ch[16];
+        int nl = level_sizes(P[k].w, P[k].h, levels, cw, ch);
+        for (int L = 0; L < nl; L++) {
+            int i = fwd ? L : nl - 1 - L;
+            if (fwd) {
+                k_lift1d_fwd<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2, st[k]>>>(P[k].d, 0, (long)P[k].w, 1, cw[i]);
+                k_lift1d_fwd<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2, st[k]>>>(P[k].d, 0, 1, (long)P[k].w, ch[i]);
+            } else {
+                k_lift1d_inv<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2, st[k]>>>(P[k].d, 0, 1, (long)P[k].w, ch[i]);
+                k_lift1d_inv<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2, st[k]>>>(P[k].d, 0, (long)P[k].w, 1, cw[i]);
+            }
         }
     }
-    HIPCHECK(hipEventRecord(e1));
-    HIPCHECK(hipGetLastError());
-    HIPCHECK(hipDeviceSynchronize());
-    float t = 0; HIPCHECK(hipEventElapsedTime(&t, e0, e1));
-    (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
-    if (ms) *ms = t;
+    for (int k = 0; k < np; k++) HIPCHECK(hipStreamSynchronize(st[k]));
+    auto t1 = std::chrono::steady_clock::now();
+    if (ms) *ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
 }
 
 #endif

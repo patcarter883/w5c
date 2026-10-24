@@ -11,9 +11,9 @@ make
 
 ./w5c enc422 /tmp/one422.yuv /tmp/f.w5c 1920 1080 5
   -> 2,925,902 B, 5.644 bpp, 8,294,400 -> 2,925,902 bytes   (blk=32, lossless)
-  -> fwd 1.95 ms  sym 5.80  pack 0.80  hist 0.63  enc 0.53  = 9.72 ms
+  -> fwd 1.99 ms  sym 4.10  pack 0.79  hist 0.95  enc 0.52  = 8.43 ms
 ./w5c dec422 /tmp/f.w5c /tmp/f_out.yuv
-  -> rANS 2.18 ms  desym 7.22 ms  inv 0.38 ms              = 9.78 ms
+  -> rANS 2.09 ms  desym 2.64 ms  inv 0.50 ms              = 5.17 ms
 ```
 
 `cmp` on the input and output: **bit-exact**. All planes of a frame travel in one container and
@@ -43,10 +43,10 @@ Two changes followed, worth 8-10x between them:
 
    | blk | bytes/frame | bpp | encode ms | decode ms |
    |---|---|---|---|---|
-   | 64 | 2,767,007 | 5.338 | 30.63 | 33.94 |
-   | **32** | **2,925,902** | **5.644** | **9.66** | **10.23** |
-   | 16 | 3,555,279 | 6.858 | 7.73 | 5.43 |
-   | 8 | 6,048,398 | 11.667 | 4.81 | 4.79 |
+   | 64 | 2,767,007 | 5.338 | 30.05 | 34.45 |
+   | **32** | **2,925,902** | **5.644** | **8.50** | **5.20** |
+   | 16 | 3,555,279 | 6.858 | 7.19 | 4.72 |
+   | 8 | 6,048,398 | 11.667 | 4.80 | 5.96 |
 
    All rows bit-exact. 32 is the default: 3x the speed of 64 for 6% rate.
 
@@ -62,20 +62,47 @@ Two changes followed, worth 8-10x between them:
    into the frame, it costs what it should. At *identical* rate (blk=64, 5.338 bpp) this alone
    took the frame from 84.5/98.4 ms to 30.5/35.2 ms.
 
-### What the micro-optimisation did and did not buy
+### What moved the needle, and what did not
 
-Two rounds of ordinary kernel tuning were measured against this and both were **noise**:
+Three attempts, in order of size, all measured:
 
-- **Row-pointer walks** (one address add per row instead of a 64-bit multiply per
-  coefficient): encode 10.17 -> 9.66 ms, decode unchanged/slightly worse. Kept because it is
-  cleaner and helps at blk=16 (8.37 -> 7.73), but it is not where the time was.
-- **Register/occupancy tuning**: `k_desym` keeps its sign bitmap in registers (68 VGPRs, zero
-  scratch, no spills). There is nothing to spill and no pressure to relieve.
+1. **Row-pointer walks** — one address add per row instead of a 64-bit multiply per
+   coefficient. 10.17 -> 9.66 ms encode, decode unchanged. Kept (cleaner, helps at blk=16),
+   but it was not where the time was. `k_desym` reports 68 VGPRs, zero scratch, zero spills:
+   there was no pressure to relieve either.
+2. **Warp-parallel desymbolise** (`k_desym_w`, 7.55 -> 2.64 ms, whole decode 10.23 -> 5.17).
+   One warp per code-block, one lane per 32-coefficient group. The serial scan disappears
+   because every bit position is derivable from masks: siggrp takes exactly one bit per group
+   per plane (so its position is analytic), and the sig, refine and sign bases are warp prefix
+   sums of per-group counts. Verified byte-identical to the old decoder, then to the source.
+3. **Shared significance flags** (`k_newly`, sym 5.48 -> 4.13 ms, encode 8.35). The same scan
+   was being repeated by all four context streams; now it runs once per (block, plane) and the
+   bitstream is provably unchanged.
 
-The lesson is the one at the top of this file: with 4,080 code-blocks and one thread walking
-each block end-to-end, the kernel is bound by the **serial dependency chain inside the walk**,
-not by instruction cost. Next coefficient's bit position depends on the previous one, so ILP is
-1 and every iteration pays full latency. More instructions or fewer, it takes the same time.
+### Why graph capture / launch tricks buy almost nothing here (measured)
+
+The frame is **not launch-bound**, so CUDA/HIP graph capture — the usual inference-serving
+trick — has almost nothing to recover:
+
+- a kernel launch costs **0.7 us** to enqueue on this stack (measured, 500 launches),
+- the frame issues ~40 launches, so ~0.03 ms total,
+- the sum of the GPU stage times is 8.35 ms against 8.43 ms of wall time, so *all* host work
+  between stages — the three device-to-host round trips, the table build, the ~34 per-frame
+  allocations — costs ~0.08 ms, about 1% of the frame.
+
+The transform proves the point from the other end: at levels=1 it issues 6 launches instead of
+30 and still measures 1.99 ms. Its cost is memory traffic, not dispatch. Capturing the frame
+into one graph would therefore recoup ~1%, and it cannot capture the pipeline as-is anyway
+because of the mid-frame host round trips (symbol offsets, frequency tables).
+
+Where inference-style ideas *would* pay is different: the three host round trips are what stop
+the frame being one graph, and removing them (device-side offsets, device-side rANS tables, a
+cached buffer pool) is worth doing for its own sake — but at ~0.08 ms it is not the bottleneck.
+
+The real cost is inside two kernels, and only one of them is still addressable cheaply: the
+transform's strided column pass, which touches ~265 MB of cache lines per pass at 1080p because
+one work-group per column reads 2,160 bytes apart. Coalescing it (phase-split predict/update
+with a ping-pong buffer) is a rewrite expected to take ~2 ms down to a few hundred microseconds.
 
 Where the remaining time sits, measured with `rocprofv3` on the encode of one 4:2:2 frame
 (7.96 ms of kernel time):
@@ -246,11 +273,12 @@ per pixel in 4:2:2), so all rows are on the same basis.
 | SVT-JPEG-XS @3.0 bits/luma-px | 777,600 | 1.500 | 10.74 | 43.43 dB |
 | DNxHR HQX | 917,569 | 1.770 | 33.89 | 31.77 dB |
 | VC\(-\)2 5/3 (tol=0) | 2,492,808 | 4.809 | 12.46 | 31.81 dB |
-| **this codec (GPU)** | **2,925,902** | **5.644** | **10.17** | **lossless** |
+| **this codec (GPU)** | **2,925,902** | **5.644** | **8.56** | **lossless** |
 | FFV1 level 3 | 2,451,713 | 4.729 | 31.88 | **lossless** |
 
-Encode-only and decode-only for this codec: **10.17 / 9.79 ms** per 4:2:2 frame, whole frame in
-one launch at blk=32, measured with `w5c` (best of 8).
+Encode-only and decode-only for this codec: **8.56 / 5.26 ms** per 4:2:2 frame at blk=32,
+measured with `w5c` (best of 8). That makes it the fastest encoder in this table — ahead of
+SVT-JPEG-XS at 1.0 bpp — while remaining lossless.
 
 ### What this actually says
 

@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     hipEvent_t e0, e1; HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
     HIPCHECK(hipDeviceSynchronize());
     HIPCHECK(hipEventRecord(e0));
-    k_sym<<<nbk, 128>>>(d_desc, nullptr, nullptr, d_nb, (int)ns, 0);
+    k_sym<<<nbk, 128>>>(d_desc, nullptr, nullptr, nullptr, d_nb, (int)ns, 0);
     k_offsets<<<1, 1>>>(d_nb, d_off, (int)ns);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
@@ -154,7 +154,7 @@ int main(int argc, char **argv)
 
     HIPCHECK(hipEventRecord(e0));
     /* the emit kernel needs per-stream byte bases; reuse d_off by passing it as the base */
-    k_sym<<<nbk, 128>>>(d_desc, d_bits, d_off, d_nb, (int)ns, 1);
+    k_sym<<<nbk, 128>>>(d_desc, nullptr, d_bits, d_off, d_nb, (int)ns, 1);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());

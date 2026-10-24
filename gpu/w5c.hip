@@ -90,8 +90,8 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
         P[i].w = pw; P[i].h = h;
     }
 
-    float ms_fwd = 0, t = 0;
-    for (int i = 0; i < np; i++) { plane_dwt(P[i].d, P[i].w, P[i].h, levels, true, &t); ms_fwd += t; }
+    float ms_fwd = 0;
+    plane_dwt_all(P, np, levels, true, &ms_fwd);
 
     std::vector<uint8_t> bits;
     stage_ms sm;
@@ -132,8 +132,8 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     stage_ms sm;
     if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
 
-    float ms_inv = 0, t = 0;
-    for (int i = 0; i < np; i++) { plane_dwt(P[i].d, P[i].w, P[i].h, levels, false, &t); ms_inv += t; }
+    float ms_inv = 0;
+    plane_dwt_all(P, np, levels, false, &ms_inv);
 
     std::vector<int16_t> out[W5C_MAXPLANES];
     int mx = 0;
