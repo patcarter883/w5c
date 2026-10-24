@@ -93,12 +93,14 @@ int main(int argc, char **argv)
     if (!coef_ok) return 1;
 
     std::vector<uint8_t> bits;
-    if (!gpu_encode_plane(d, w, h, levels, bits, &sf)) { printf("GPU encode failed\n"); return 1; }
+    plane_t P1[1] = {{d, w, h}};
+    if (!gpu_encode_frame(P1, 1, levels, 64, bits, &sf)) { printf("GPU encode failed\n"); return 1; }
 
     {
         const uint32_t *h32 = (const uint32_t *)bits.data();
-        int ntab = (int)h32[6], nblocks = (int)h32[4], ns = (int)h32[5];
-        size_t off = 28 + (size_t)ntab * NSYM * 2 + (size_t)nblocks * 4 + (size_t)ns * 8;
+        int ntab = (int)h32[5], nblocks = (int)h32[3], ns = (int)h32[4], npl = (int)h32[1];
+        size_t off = 32 + (size_t)npl * 8 + (size_t)ntab * NSYM * 2
+                   + (size_t)nblocks * 4 + (size_t)ns * 8;
         size_t plen = bits.size() - off;
         int same = (plen == refbits.size()) && !memcmp(bits.data() + off, refbits.data(), plen);
         printf("2. GPU encode          %7.2f ms   %s (%zu B)\n",
@@ -110,7 +112,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!gpu_decode_plane(bits.data(), bits.size(), d, &sc)) { printf("GPU decode failed\n"); return 1; }
+    if (!gpu_decode_frame(bits.data(), bits.size(), P1, 1, &sc)) { printf("GPU decode failed\n"); return 1; }
     std::vector<int16_t> coef_dec(npx);
     HIPCHECK(hipMemcpy(coef_dec.data(), d, npx * 2, hipMemcpyDeviceToHost));
     int dec_ok = memcmp(coef_dec.data(), coef_refdec.data(), npx * 2) == 0;

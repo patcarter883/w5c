@@ -100,6 +100,9 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < ns; i++) { q += 8; memcpy(rsyms.data() + wr, bsym + q, rslen[i]); wr += rslen[i]; q += rslen[i]; }
 
     /* build the descriptor array in exactly the reference's stream order */
+    int16_t *d_plane = nullptr;
+    HIPCHECK(hipMalloc(&d_plane, npx * 2));
+    HIPCHECK(hipMemcpy(d_plane, coef.data(), npx * 2, hipMemcpyHostToDevice));
     subband_t sb[64];
     int nsb = dwt53_subbands(w, h, levels, sb, 64);
     std::vector<sdesc> desc;
@@ -118,7 +121,8 @@ int main(int argc, char **argv)
                     }
                 int mb = 0; while (mx) { mb++; mx >>= 1; }
                 for (int c = 0; c < 4; c++)
-                    desc.push_back({x0, y0, bw, bh, mb, c, s * 4 + c});
+                    { sdesc e = {}; e.x0 = x0; e.y0 = y0; e.bw = bw; e.bh = bh; e.mb = mb;
+                      e.ctx = c; e.tab = s * 4 + c; e.pl = d_plane; e.pw = w; desc.push_back(e); }
             }
     if ((uint32_t)desc.size() != ns) { printf("stream count mismatch: desc %zu vs ref %u\n", desc.size(), ns); return 1; }
 
@@ -126,19 +130,17 @@ int main(int argc, char **argv)
     printf("host symbolise: %.1f ms\n", ms_host);
 
     /* ---- GPU symbolisation ---- */
-    int16_t *d_plane; sdesc *d_desc; uint8_t *d_bits; uint32_t *d_nb, *d_off;
-    HIPCHECK(hipMalloc(&d_plane, npx * 2));
+    sdesc *d_desc; uint8_t *d_bits; uint32_t *d_nb, *d_off;
     HIPCHECK(hipMalloc(&d_desc, desc.size() * sizeof(sdesc)));
     HIPCHECK(hipMalloc(&d_nb, ns * 4));
     HIPCHECK(hipMalloc(&d_off, (ns + 1) * 4));
-    HIPCHECK(hipMemcpy(d_plane, coef.data(), npx * 2, hipMemcpyHostToDevice));
     HIPCHECK(hipMemcpy(d_desc, desc.data(), desc.size() * sizeof(sdesc), hipMemcpyHostToDevice));
 
     int nbk = (ns + 127) / 128;
     hipEvent_t e0, e1; HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
     HIPCHECK(hipDeviceSynchronize());
     HIPCHECK(hipEventRecord(e0));
-    k_sym<<<nbk, 128>>>(d_plane, w, d_desc, nullptr, nullptr, d_nb, (int)ns, 0);
+    k_sym<<<nbk, 128>>>(d_desc, nullptr, nullptr, d_nb, (int)ns, 0);
     k_offsets<<<1, 1>>>(d_nb, d_off, (int)ns);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
@@ -152,7 +154,7 @@ int main(int argc, char **argv)
 
     HIPCHECK(hipEventRecord(e0));
     /* the emit kernel needs per-stream byte bases; reuse d_off by passing it as the base */
-    k_sym<<<nbk, 128>>>(d_plane, w, d_desc, d_bits, d_off, d_nb, (int)ns, 1);
+    k_sym<<<nbk, 128>>>(d_desc, d_bits, d_off, d_nb, (int)ns, 1);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());

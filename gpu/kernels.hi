@@ -283,6 +283,8 @@ struct sdesc {
     int mb;
     int ctx;        /* 0 siggrp, 1 sig, 2 sign, 3 refine */
     int tab;        /* subband*4 + ctx */
+    int16_t *pl;    /* the plane this block lives in */
+    int pw;         /* that plane's row stride */
 };
 
 __device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x0, int cx, int cy)
@@ -290,8 +292,7 @@ __device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x
     return plane[(size_t)(y0 + cy) * w + x0 + cx];
 }
 
-__global__ void k_sym(const int16_t * __restrict__ plane, int w,
-                      const sdesc * __restrict__ d,
+__global__ void k_sym(const sdesc * __restrict__ d,
                       uint8_t * __restrict__ out,
                       const uint32_t * __restrict__ boff,
                       uint32_t * __restrict__ nbits,
@@ -314,7 +315,7 @@ __global__ void k_sym(const int16_t * __restrict__ plane, int w,
             {
                 int cx = gx, cy = gy;
                 for (int i = g0; i < g1; i++) {
-                    int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
+                    int v = blk_at(sd.pl, sd.pw, sd.y0, sd.x0, cx, cy);
                     int m = v < 0 ? -v : v;
                     if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
                     if (++cx == bw) { cx = 0; cy++; }
@@ -331,7 +332,7 @@ __global__ void k_sym(const int16_t * __restrict__ plane, int w,
 
             int cx = gx, cy = gy;
             for (int i = g0; i < g1; i++) {
-                int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
+                int v = blk_at(sd.pl, sd.pw, sd.y0, sd.x0, cx, cy);
                 int m = v < 0 ? -v : v;
                 if (m >> (p + 1)) {
                     if (ctx == 3) {
@@ -482,18 +483,17 @@ __global__ void k_unpack(const uint8_t * __restrict__ syms,
             }
 }
 
-struct bdesc { int x0, y0, bw, bh, mb; };
+struct bdesc { int x0, y0, bw, bh, mb; int16_t *pl; int pw; };
 
 /* block bitplane count, so the host never has to download the whole plane to learn it */
-__global__ void k_block_mb(const int16_t * __restrict__ plane, int w,
-                           bdesc * __restrict__ bd, int nblocks)
+__global__ void k_block_mb(bdesc * __restrict__ bd, int nblocks)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
     bdesc d = bd[b];
     int mx = 0;
     for (int y = 0; y < d.bh; y++) {
-        const int16_t *row = plane + (size_t)(d.y0 + y) * w + d.x0;
+        const int16_t *row = d.pl + (size_t)(d.y0 + y) * d.pw + d.x0;
         for (int x = 0; x < d.bw; x++) {
             int v = row[x]; v = v < 0 ? -v : v;
             if (v > mx) mx = v;
@@ -507,23 +507,22 @@ __global__ void k_block_mb(const int16_t * __restrict__ plane, int w,
 /* One thread per code-block: the walk interleaves the four contexts, so it cannot be split
    per context. Magnitude is accumulated straight into the destination plane and the sign is
    held in a small bitmap, which avoids a per-coefficient state array. */
+template <int MAXN>
 __global__ void k_desym(const uint8_t * __restrict__ bits,
                         const uint32_t * __restrict__ boff,
-                        const bdesc * __restrict__ bd,
-                        int16_t * __restrict__ plane, int w,
-                        int nblocks)
+                        const bdesc * __restrict__ bd, int nblocks)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
 
     bdesc d = bd[b];
-    int bw = d.bw, bh = d.bh, n = bw * bh;
-    int16_t *base = plane + (size_t)d.y0 * w + d.x0;
+    int bw = d.bw, bh = d.bh, n = bw * bh, w = d.pw;
+    int16_t *base = d.pl + (size_t)d.y0 * w + d.x0;
     const uint8_t *st[4];
     size_t pos[4] = {0, 0, 0, 0};
     for (int c = 0; c < 4; c++) st[c] = bits + boff[b * 4 + c];
 
-    uint32_t sgn[(64 * 64) / 32];
+    uint32_t sgn[MAXN / 32];
     for (int i = 0; i < n / 32; i++) sgn[i] = 0;
 
     /* zero the block */
