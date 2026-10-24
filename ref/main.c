@@ -122,12 +122,25 @@ int main(int argc, char **argv)
     for (int cfg = 0; cfg < 3; cfg++) {
         vec_t out = {0};
         codestats_t st;
+        FILE *fs = NULL, *fe = NULL, *ft = NULL;
+        const char *dump = getenv("DUMP");
+        if (cfg == 2 && dump) {
+            char p[512];
+            snprintf(p, sizeof p, "%s.sym", dump); fs = fopen(p, "wb");
+            snprintf(p, sizeof p, "%s.enc", dump); fe = fopen(p, "wb");
+            snprintf(p, sizeof p, "%s.tab", dump); ft = fopen(p, "wb");
+            codec_set_dump(fs, fe, ft);
+        }
         double t1 = now_s();
         if (codec_encode(coef, w, h, levels, cfg, &out, &st)) {
             printf("  cfg %d ENCODE ERROR\n", cfg);
             return 1;
         }
         double t_enc = now_s() - t1;
+        if (fs) {
+            codec_set_dump(NULL, NULL, NULL);
+            fclose(fs); fclose(fe); fclose(ft);
+        }
 
         memset(rec, 0xAA, sizeof(int16_t) * npx);
         t1 = now_s();

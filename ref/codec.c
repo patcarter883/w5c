@@ -10,6 +10,13 @@
 #define MAXSUB   64
 #define MAGIC    0x3554u     /* "5T" */
 
+/* cross-validation dump (see codec.h) */
+static FILE *g_dsym, *g_denc, *g_dtab;
+void codec_set_dump(void *sym, void *enc, void *tab)
+{
+    g_dsym = sym; g_denc = enc; g_dtab = tab;
+}
+
 /* ------------------------------------------------------------------ vec */
 int vec_reserve(vec_t *v, size_t need)
 {
@@ -405,6 +412,17 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
             for (int c = 0; c < CODEC_CTX; c++)
                 for (int k = 0; k < NSYM; k++) vec_u16(out, tab[s][c].freq[k]);
     }
+    if (g_dsym && cfg == 2) {
+        uint32_t ns = (uint32_t)(tot_blocks * CODEC_CTX);
+        uint32_t hdr[4] = { ns, (uint32_t)f.nsb, (uint32_t)CODEC_CTX, (uint32_t)NSYM };
+        fwrite(hdr, 4, 4, g_dsym);
+        fwrite(&ns, 4, 1, g_denc);
+        uint32_t th[3] = { (uint32_t)f.nsb, (uint32_t)CODEC_CTX, (uint32_t)NSYM };
+        fwrite(th, 4, 3, g_dtab);
+        for (int s2 = 0; s2 < f.nsb; s2++)
+            for (int c2 = 0; c2 < CODEC_CTX; c2++)
+                fwrite(tab[s2][c2].freq, sizeof(uint16_t), NSYM, g_dtab);
+    }
 
     /* pass 2: emit */
     for (int s = 0; s < f.nsb; s++) {
@@ -443,6 +461,14 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
                         if (ns && !sz) { free(t); free(blk); io_free(&io); free(tab); free(syms); return -1; }
                         tmp[c] = t; nsym[c] = (uint32_t)ns; plen[c] = (uint32_t)sz;
                         st->ctx[c].bytes_b += sz;
+                        if (g_dsym) {
+                            uint32_t ti32 = (uint32_t)((cfg == 2 ? s : 0) * CODEC_CTX + c);
+                            fwrite(&ti32, 4, 1, g_dsym);
+                            fwrite(&nsym[c], 4, 1, g_dsym);
+                            fwrite(syms, 1, ns, g_dsym);
+                            fwrite(&plen[c], 4, 1, g_denc);
+                            fwrite(t, 1, sz, g_denc);
+                        }
                     }
                     vec_put(out, nsym, sizeof nsym);
                     vec_put(out, plen, sizeof plen);

@@ -32,6 +32,12 @@ typedef struct {
 int  vec_reserve(vec_t *v, size_t need);
 void vec_free(vec_t *v);
 
+/* Optional: export the coded streams for cross-validation on another engine.
+   sym gets (u32 n, u8 bytes) per stream; enc gets (u32 len, u8 bytes) per stream;
+   tab gets the frequency tables. Pass NULLs to disable. */
+struct _IO_FILE;
+void codec_set_dump(void *sym, void *enc, void *tab);
+
 /* Returns 0 on success, negative on error. */
 int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
                  vec_t *out, codestats_t *st);
