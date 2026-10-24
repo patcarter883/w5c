@@ -69,6 +69,11 @@ check: all dumps
 	./w5c enc $(REF)/testdata/f0000_g8.y8 /tmp/w5c_rt.w5c 1920 1080 5
 	./w5c dec /tmp/w5c_rt.w5c /tmp/w5c_rt.raw
 	cmp $(REF)/testdata/f0000_g8.y8 /tmp/w5c_rt.raw && echo "w5c file round-trip bit-exact"
+	@# whole-frame path: 3 planes, one container, one launch per stage
+	head -c 16384 /dev/urandom > /tmp/w5c_422.yuv
+	./w5c enc422 /tmp/w5c_422.yuv /tmp/w5c_422.w5c 64 64 3 >/dev/null
+	./w5c dec422 /tmp/w5c_422.w5c /tmp/w5c_422_o.yuv >/dev/null
+	cmp /tmp/w5c_422.yuv /tmp/w5c_422_o.yuv && echo "w5c 4:2:2 round-trip bit-exact"
 	@echo "all binaries validated"
 
 clean:

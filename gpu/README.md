@@ -1,29 +1,77 @@
 # GPU wavelet codec
 
-**MVP: `w5c` is the codec.** Encode a raw plane to a self-contained bitstream and back,
-bit-exactly:
+**MVP: `w5c` is the codec.** Encode a frame to a self-contained bitstream and back, bit-exactly:
 
 ```
 make
-./w5c enc <in.raw> <out.w5c> <w> <h> [levels]     # raw plane: 16-bit LE (>8-bit) or 8-bit
-./w5c dec <in.w5c> <out.raw>
+./w5c enc422 <in.yuv> <out.w5c> <w> <h> [levels]   # yuv422p10le in, whole frame, one launch
+./w5c dec422 <in.w5c> <out.yuv>
+./w5c enc    <in.raw> <out.w5c> <w> <h> [levels]   # one raw plane: 16-bit LE or 8-bit
+./w5c dec    <in.w5c> <out.raw>
 
-./w5c enc /tmp/pl_y.raw /tmp/y.w5c 1920 1080 5
-  -> 1367980 B, 5.278 bpp, 4147200 -> 1367980 bytes
-  -> fwd 1.69 ms  sym 18.62  pack 2.07  hist 1.28  enc 1.27  = 24.92 ms
-./w5c dec /tmp/y.w5c /tmp/y_out.raw
-  -> rANS 3.14 ms  desym 25.93 ms  inv 0.19 ms
+./w5c enc422 /tmp/one422.yuv /tmp/f.w5c 1920 1080 5
+  -> 2,925,902 B, 5.644 bpp, 8,294,400 -> 2,925,902 bytes   (blk=32, lossless)
+  -> fwd 1.95 ms  sym 5.80  pack 0.80  hist 0.63  enc 0.53  = 9.72 ms
+./w5c dec422 /tmp/f.w5c /tmp/f_out.yuv
+  -> rANS 2.18 ms  desym 7.22 ms  inv 0.38 ms              = 9.78 ms
 ```
 
-`cmp` on the input and output: **bit-exact**. One plane per stream — 4:2:0/4:2:2 content is
-three streams, encoded independently; there is no single multi-plane container yet, and no
-rate control (lossless only).
+`cmp` on the input and output: **bit-exact**. All planes of a frame travel in one container and
+are encoded in one kernel launch per stage. No rate control (lossless only), no muxing.
 
-Container: `"W5C1"`, then w/h/levels/block/stream/table counts, the frequency tables, per-block
-bitplane counts, per-stream symbol and payload lengths, then the payloads concatenated.
+`W5C_BLK` sets the code-block size (8/16/32/64, default **32**). It is the speed/rate knob, and
+it is the single most important parameter in the codec — see the trade curve below.
 
-The pipeline itself lives in `pipeline.hip` and is shared by `w5c` and the `codec_gpu`
-validation harness — the kernel launch sequence exists in exactly one place.
+Container: `"W5C1"`, then plane count/levels/block/stream/table counts, the per-plane
+dimensions, one shared set of frequency tables, per-block bitplane counts, per-stream symbol
+and payload lengths, then the payloads concatenated.
+
+The pipeline lives in `pipeline.hip` and is shared by `w5c` and the `codec_gpu` validation
+harness — the kernel launch sequence exists in exactly one place.
+
+### The one thing that made it fast: work-item count
+
+Profiling showed every kernel at 24-34 VGPRs, no spills, no LDS pressure. Occupancy was never
+resource-limited — it was limited by **how few work-items existed**. Desymbolise ran one thread
+per code-block (506 at 1080p) and symbolise one per stream, so the machine sat a fraction of a
+wave deep and every stage was latency-bound, not throughput-bound.
+
+Two changes followed, worth 8-10x between them:
+
+1. **Code-block size as a parameter.** Blocks are the work-items, so block size *is* the
+   parallelism knob, and it trades directly against rate (smaller block = less context):
+
+   | blk | bytes/frame | bpp | encode ms | decode ms |
+   |---|---|---|---|---|
+   | 64 | 2,767,007 | 5.338 | 30.50 | 35.23 |
+   | **32** | **2,925,902** | **5.644** | **10.05** | **9.81** |
+   | 16 | 3,555,279 | 6.858 | 8.37 | 5.36 |
+   | 8 | 6,048,398 | 11.667 | 5.09 | 4.90 |
+
+   All rows bit-exact. 32 is the default: 3x the speed of 64 for 6% rate.
+
+2. **All planes in one launch.** A 1080p chroma plane has a quarter of the code-blocks of luma
+   and on its own left the machine idle — it cost 9.3 ms for a quarter of the pixels. Batched
+   into the frame, it costs what it should. At *identical* rate (blk=64, 5.338 bpp) this alone
+   took the frame from 84.5/98.4 ms to 30.5/35.2 ms.
+
+Where the remaining time sits, measured with `rocprofv3` on the encode of one 4:2:2 frame
+(7.96 ms of kernel time):
+
+| kernel | ms | share |
+|---|---|---|
+| `k_sym` (symbolise + emit) | 5.79 | 73% |
+| `k_pack` | 0.78 | 10% |
+| `k_enc` (rANS) | 0.52 | 7% |
+| `k_hist` | 0.41 | 5% |
+| `k_lift1d_fwd` x30 | 0.31 | 4% |
+
+Note the transform reports 1.95 ms of wall time but only 0.31 ms of GPU time: it is 30 small
+launches per frame, so 1.6 ms is launch gap. Same for decode: `k_desym` is 7.22 of 9.78 ms.
+Both remaining hot spots are serial walks, one thread per stream — the fix is warp-cooperative
+(32 lanes over a significance group, ballot for the flags, warp scan for bit positions), which
+needs the bit-position dependency handled per group. That is the next real win and it is not
+done yet.
 
 # Harnesses
 
@@ -176,24 +224,24 @@ per pixel in 4:2:2), so all rows are on the same basis.
 | SVT-JPEG-XS @3.0 bits/luma-px | 777,600 | 1.500 | 10.74 | 43.43 dB |
 | DNxHR HQX | 917,569 | 1.770 | 33.89 | 31.77 dB |
 | VC\(-\)2 5/3 (tol=0) | 2,492,808 | 4.809 | 12.46 | 31.81 dB |
-| **this codec (GPU)** | **2,775,698** | **5.354** | **84.50** | **lossless** |
+| **this codec (GPU)** | **2,925,902** | **5.644** | **10.17** | **lossless** |
 | FFV1 level 3 | 2,451,713 | 4.729 | 31.88 | **lossless** |
 
-Encode-only and decode-only: **84.50 / 98.39 ms** per 4:2:2 frame (three planes, measured with `w5c`).
+Encode-only and decode-only for this codec: **10.17 / 9.79 ms** per 4:2:2 frame, whole frame in
+one launch at blk=32, measured with `w5c` (best of 8).
 
-### What this actually says — it is not competitive yet
+### What this actually says
 
-1. **Rate: 13% worse than FFV1**, the true lossless comparison (5.347 vs 4.729 bpp). FFV1 uses
-   a context-modelled range coder; this codec has no context modelling beyond symbol packing.
-   That gap is the price of the parallel-friendly symbolisation, and it is now quantified on
-   real content rather than estimated.
-2. **Speed: slowest of the six, on a GPU.** 83.5 ms vs 9-34 ms for everything else. FFV1 does
-   it in 30.7 ms on the CPU. The GPU is not paying for itself yet, and the reason is already
-   measured: symbolise and desymbolise are *one thread per code-block*, so the machine runs
-   one wave deep (desym alone is 26-32 ms of the 83.5).
-3. **SVT-JPEG-XS is the real bar and it is far ahead**: 43.4 dB at 1.5 bpp in 10.6 ms. That is
-   what a mezzanine codec designed for SIMD looks like. Beating it needs both context modelling
-   and real parallelism, not either.
+1. **Speed: the GPU is now paying for itself.** 10.17 ms encode against FFV1's 31.16 ms on the
+   CPU — 3.1x faster than the only true-lossless peer here, and faster than VC-2 (12.43) and
+   DNxHR HQX (33.36) as well. SVT-JPEG-XS is still quicker (9.12-10.71 ms) but it is lossy at
+   1.0-1.5 bpp; it is not the same trade.
+2. **Rate: still 19% worse than FFV1** (5.644 vs 4.729 bpp) — the cost of the smaller
+   code-blocks plus no context modelling beyond symbol packing. At blk=64 the gap is 13%
+   (5.338 bpp) but the frame costs 30.5/35.2 ms. That trade is now a knob, not a fixed property.
+3. **SVT-JPEG-XS is still the bar for a mezzanine codec**: 40.4-43.4 dB at 1.0-1.5 bpp in under
+   11 ms. Matching that *and* staying lossless is not a tuning problem; it needs context
+   modelling (rate) and warp-cooperative symbolisation (speed).
 4. **The VC-2 row is unflattering to VC-2, not to this codec**: ffmpeg's encoder needs 4.809 bpp
    to reach 31.8 dB, which is a basic encoder, not a fair picture of VC-2's potential. Note the
    comparison is against *ffmpeg's* VC-2, not a tuned implementation.
@@ -210,29 +258,17 @@ Encode-only and decode-only: **84.50 / 98.39 ms** per 4:2:2 frame (three planes,
   "natural-ish" cost 30 ms, because real content has more significant coefficients and a
   higher bitplane count.
 
-### The two fixes, in order of payoff
+### The next two fixes, in order of payoff
 
-1. **Desymbolise is 30-36% of the frame** and is one thread per block (253-506 work-items).
-   The walk is sequential *within* a block by construction, so the fix is warp-cooperative:
-   32 lanes covering a significance group, ballot for the flags, warp scan for bit positions.
-2. **Context modelling** for the rate. The 13% FFV1 gap is context; the parallel-friendly way
-   to buy some of it is per-subband *and* per-bitplane-group tables (cheap at 6-bit symbols)
-   plus a separate table per significance-group position.
+1. **Warp-cooperative symbolise/desymbolise** — `k_sym` is 73% of encode and `k_desym` 74% of
+   decode, both serial walks with one thread per stream. 32 lanes over a significance group,
+   ballot for the group flags, warp scan for the per-lane bit positions. The dependency to
+   solve is that sign bits follow sig bits at variable offsets, so the sign context needs a
+   prefix sum after the sig read.
+2. **Fuse the transform's 30 launches** — 1.6 ms of the 9.7 ms encode is launch gap, not work
+   (30 kernels carrying 0.31 ms of GPU time). One launch per (level, axis) across all planes.
 
-## Entropy decode
-
-```
-streams 8428 | symbols 7927243 | bitstream 5315830 bytes | tables 64 (280 KB)
-validation: symbol streams identical to reference (0/8428 streams differ, 0 errors)
-CPU single core decode: 0.206 Gsym/s (38.4 ms)
-GPU: 5.17 Gsym/s at the frame's natural 8428 streams  (25× a core)
-```
-
-Decodes the reference bitstreams and reproduces the reference **symbol streams exactly** —
-so encode and decode are now both pinned against the C reference, independently.
-
-Decode tables are 280 KB per frame (4 KB slot table × 64 context-tables) so they live in
-global memory, not `__constant__`. That is the main structural difference from the encoder.
+Context modelling for the rate is still the standing gap to FFV1, unchanged by any of the above.
 
 ### Two things worth flagging
 
