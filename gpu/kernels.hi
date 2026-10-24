@@ -136,6 +136,30 @@ __device__ __forceinline__ int mir(int i, int n)
 /* The reference writes each detail into the int16 line and reads it back, so a value that
    overflows int16 is truncated at that point. Recomputing it must truncate identically, or the
    update phase sees a different number than the stored one. */
+/* Deslauriers-Dubuc interpolating predictors, scaled integer form as used by VC-2/Dirac.
+   9/7 is DD4: (9(e0+e1) - e-1 - e+2 + 8) >> 4.  13/7 is DD6: (3a - 25b + 150c + 128) >> 8.
+   Both are interpolating, so only *even* neighbours are read. */
+__device__ __forceinline__ int pred_dd(const int16_t *s, int stride, int k, int nev, int wav)
+{
+    if (wav == 2) {
+        int a = s[2 * mir(k - 2, nev) * stride] + s[2 * mir(k + 3, nev) * stride];
+        int b = s[2 * mir(k - 1, nev) * stride] + s[2 * mir(k + 2, nev) * stride];
+        int c = s[2 * mir(k, nev) * stride]     + s[2 * mir(k + 1, nev) * stride];
+        return (3 * a - 25 * b + 150 * c + 128) >> 8;
+    }
+    int e0 = s[2 * mir(k, nev) * stride];
+    int e1 = s[2 * mir(k + 1, nev) * stride];
+    int em = s[2 * mir(k - 1, nev) * stride];
+    int ep = s[2 * mir(k + 2, nev) * stride];
+    return (9 * (e0 + e1) - em - ep + 8) >> 4;
+}
+
+/* detail coefficient j, truncated to int16 exactly where it is stored */
+__device__ __forceinline__ int det_dd(const int16_t *s, int stride, int j, int nev, int wav)
+{
+    return (int16_t)(s[(2 * j + 1) * stride] - pred_dd(s, stride, j, nev, wav));
+}
+
 __device__ __forceinline__ int det_at(const int16_t *s, int stride, int j, int nev)
 {
     int a = s[2 * mir(j, nev) * stride];
@@ -191,15 +215,15 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (wav) {
-        /* Haar (1/1): the detail needs only its own pair, so there is no neighbour to fetch and
-           no vertical support beyond one line - that is the property that would make a slice
-           restart nearly free. */
-        int a = 0, b = 0, dd = 0;
-        if (k < nod) { a = s[2 * k * stride]; b = s[(2 * k + 1) * stride]; dd = b - a;
-                       d[(nev + k) * stride] = (int16_t)dd; }
+        if (k < nod) d[(nev + k) * stride] = (int16_t)det_dd(s, stride, k, nev, wav);
         if (k < nev) {
-            int ev = s[2 * k * stride];
-            d[k * stride] = (int16_t)(ev + (dd >> 1));
+            int acc = 0;
+            if (nod > 0) {
+                int a = det_dd(s, stride, mir(k - 1, nod), nev, wav);
+                int b = det_dd(s, stride, mir(k, nod), nev, wav);
+                acc = (a + b + 2) >> 2;
+            }
+            d[k * stride] = (int16_t)(s[2 * k * stride] + acc);
         }
     } else {
         if (k < nod)
@@ -232,13 +256,15 @@ __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __re
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (wav) {
-        if (k < nod) {
-            int dd = s[(nev + k) * stride];
-            int ev = s[k * stride] - (dd >> 1);
-            d[2 * k * stride] = (int16_t)ev;
-            d[(2 * k + 1) * stride] = (int16_t)(dd + ev);
-        } else if (k < nev) {
-            d[2 * k * stride] = s[k * stride];
+        /* only the even samples here; the odds need them reconstructed first */
+        if (k < nev) {
+            int acc = 0;
+            if (nod > 0) {
+                int a = s[(nev + mir(k - 1, nod)) * stride];
+                int b = s[(nev + mir(k, nod)) * stride];
+                acc = (a + b + 2) >> 2;
+            }
+            d[2 * k * stride] = (int16_t)(s[k * stride] - acc);
         }
     } else {
         if (k < nev)
@@ -249,6 +275,29 @@ __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __re
             d[(2 * k + 1) * stride] = (int16_t)(s[(nev + k) * stride] + ((a + b) >> 1));
         }
     }
+}
+
+/* Second half of the Deslauriers-Dubois inverse: the odd samples, once the evens exist in dst.
+   Two passes are needed because each odd sample is predicted from reconstructed evens. */
+__global__ void k_dwt_inv_odd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
+                                    int y0_step, int line_pitch, int stride,
+                                    int posmajor, spr sp, int ns, int wav)
+{
+    int sl = blockIdx.y;
+    if (sl >= ns) return;
+    int n = sp.n[sl], nlines = sp.nl[sl];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int line, k;
+    if (posmajor) { line = idx / n; k = idx - line * n; }
+    else          { k = idx / nlines; line = idx - k * nlines; }
+    int nev = (n + 1) / 2, nod = n / 2;
+    if (line >= nlines || k >= nod || n <= 1) return;
+
+    int org = sp.y0[sl] * y0_step;
+    const int16_t *sd = src + org + line * line_pitch;
+    const int16_t *se = dst + org + line * line_pitch;
+    int16_t *d = dst + org + line * line_pitch;
+    d[(2 * k + 1) * stride] = (int16_t)(sd[(nev + k) * stride] + pred_dd(se, stride, k, nev, wav));
 }
 
 __global__ void k_enc(const gtab_t * __restrict__ c_tab,

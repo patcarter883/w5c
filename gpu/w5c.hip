@@ -95,13 +95,16 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     if (const char *e = getenv("W5C_QP")) qp = atoi(e);
     int slice_h = 0;
     if (const char *e = getenv("W5C_SLICE")) slice_h = atoi(e);
-    int wav = 0;
-    if (const char *e = getenv("W5C_WAV")) wav = (e[0] == 'h' || e[0] == 'H') ? 1 : atoi(e);
+    int wav = 0;   /* 0 = LeGall 5/3 (lossless), 1 = Deslauriers-Dubuc 9/7, 2 = DD 13/7 */
+    if (const char *e = getenv("W5C_WAV")) {
+        if (!strcmp(e, "97") || !strcmp(e, "9/7")) wav = 1;
+        else if (!strcmp(e, "137") || !strcmp(e, "13/7")) wav = 2;
+        else wav = atoi(e);
+    }
 
-    /* Haar's detail coefficient is b - a, which needs one more bit than the input. At 10-bit
-       that is 11 bits and comfortably inside int16, but a full-range 16-bit source overflows and
-       the wrap corrupts the reconstruction. 5/3 does not have this problem: its detail is bounded
-       by the input range rather than twice it. */
+    /* The interpolating predictors produce details one bit wider than the input, so a full-range
+       16-bit source would overflow int16 and the wrap would corrupt the reconstruction. 5/3 does
+       not have this: its detail is bounded by the input range rather than twice it. */
     if (wav) {
         long mx = 0;
         for (int i = 0; i < np; i++)
@@ -111,8 +114,8 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
             }
         if (mx > 16383) {
             fprintf(stderr,
-                "haar: source samples reach %ld, which exceeds 14 bits; the detail coefficient "
-                "would overflow int16. Use W5C_WAV=5 (default) for this input.\n", mx);
+                "wav=%d: source samples reach %ld, which exceeds 14 bits; the detail coefficient "
+                "would overflow int16. Use W5C_WAV=0 (5/3, default) for this input.\n", wav, mx);
             return 1;
         }
     }
@@ -165,7 +168,7 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     double px = (double)w * h * (yuv422 ? 2.0 : 1.0);   /* 4:2:2 = 2 samples per pixel */
     double tot = rep > 1 ? best : ms_fwd + sm.sym + sm.pack + sm.hist + sm.enc;
     printf("%s: %dx%d%s levels=%d blk=%d slice=%d wav=%s  %zu B  %.3f bpp  %zu -> %zu bytes\n",
-           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, slice_h, wav ? "haar" : "5/3", bits.size(),
+           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, slice_h, wav == 2 ? "dd13/7" : (wav == 1 ? "dd9/7" : "5/3"), bits.size(),
            (double)bits.size() * 8.0 / px, raw.size(), bits.size());
     printf("  fwd %.2f ms  sym %.2f  pack %.2f  hist %.2f  enc %.2f  = %.2f ms\n",
            ms_fwd, sm.sym, sm.pack, sm.hist, sm.enc, tot);

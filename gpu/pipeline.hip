@@ -489,6 +489,22 @@ static void split_launch(bool fwd, const int16_t *src, int16_t *dst, long y0_ste
     else     k_dwt_inv_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns, wav);
 }
 
+static void split_launch_odd(const int16_t *src, int16_t *dst, int y0_step,
+                             int line_pitch, int stride, int posmajor,
+                             const spr &sp, int ns, int wav)
+{
+    if (ns <= 0) return;
+    long most = 0;
+    for (int i = 0; i < ns; i++) {
+        int n = sp.n[i], nl = sp.nl[i];
+        long t = posmajor ? (long)nl * n : (long)nl * ((n + 1) / 2);
+        if (t > most) most = t;
+    }
+    if (most <= 0) return;
+    dim3 grid((unsigned)((most + 255) / 256), (unsigned)ns);
+    k_dwt_inv_odd_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns, wav);
+}
+
 /* Forward / inverse transform, slice by slice.
 
    Two coalesced passes per axis per level, ping-ponging between the plane and a cached scratch
@@ -543,8 +559,11 @@ static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, i
                 split_launch(true, P[k].d, scr[k], (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
                 split_launch(true, scr[k], P[k].d, (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
             } else {
+                /* columns first, then rows, undoing the forward order */
                 split_launch(false, P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
+                if (wav) split_launch_odd(P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns, wav);
                 split_launch(false, scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
+                if (wav) split_launch_odd(scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns, wav);
             }
         }
     }
