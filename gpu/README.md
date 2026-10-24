@@ -50,6 +50,13 @@ Two changes followed, worth 8-10x between them:
 
    All rows bit-exact. 32 is the default: 3x the speed of 64 for 6% rate.
 
+   **Where the rate cost of small blocks actually goes:** 31% of it, at every step, is rANS
+   flush overhead — 4 bytes of final state per stream, and every halving of block size
+   quadruples the stream count. At blk=32 the frame carries 16,964 streams and 68 KB of flush
+   (2.3% of the file); at blk=8 it carries 261,668 streams and 1.02 MB of flush. So the
+   parallelism in the table is *bought with stream count*, not just with modelling. Any future
+   scheme that gets more work-items **without** adding streams would scale for nearly free.
+
 2. **All planes in one launch.** A 1080p chroma plane has a quarter of the code-blocks of luma
    and on its own left the machine idle — it cost 9.3 ms for a quarter of the pixels. Batched
    into the frame, it costs what it should. At *identical* rate (blk=64, 5.338 bpp) this alone
