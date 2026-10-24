@@ -64,7 +64,7 @@ int main(int argc, char **argv)
         if (!plane_dwt_all(PT, 1, levels, true, nullptr, 0)) return 1;
         HIPCHECK(hipGetLastError());
         HIPCHECK(hipMemcpy(coef.data(), d, npx * 2, hipMemcpyDeviceToHost));
-        hipFree(d);
+        (void)hipFree(d);
     }
 
     /* reference symbolisation of the same coefficients, captured in memory */

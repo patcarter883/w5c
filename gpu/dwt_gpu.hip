@@ -101,6 +101,6 @@ int main(int argc, char **argv)
     printf("GPU inverse: %.2f ms\n", ms2);
     printf("\n%s\n", (diff == 0 && diff2 == 0) ? "transform bit-exact on GPU" : "*** MISMATCH ***");
 
-    hipFree(d);
+    (void)hipFree(d);
     return (diff || diff2) ? 1 : 0;
 }

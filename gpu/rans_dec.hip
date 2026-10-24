@@ -208,8 +208,8 @@ int main(int argc, char **argv)
         if (gsym > best) best = gsym;
         printf("%-5d %-9zu %-12.3f %-12.1f %.1f\n", rep, n2, gsym, gsym / cpu_rate,
                (double)encb.size() * rep / dt / 1e9);
-        hipFree(D_enc); hipFree(D_sym); hipFree(D_so); hipFree(D_sl);
-        hipFree(D_eo); hipFree(D_el); hipFree(D_st); hipFree(D_err);
+        (void)hipFree(D_enc); (void)hipFree(D_sym); (void)hipFree(D_so); (void)hipFree(D_sl);
+        (void)hipFree(D_eo); (void)hipFree(D_el); (void)hipFree(D_st); (void)hipFree(D_err);
     }
     printf("\npeak decode %.3f Gsym/s on %d (reported) processors\n", best, prop.multiProcessorCount);
     return 0;
