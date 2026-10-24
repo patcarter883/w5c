@@ -2,9 +2,12 @@ HIP ?= hipcc
 ARCH ?= gfx1201
 REF  := ../ref
 
-all: rans_gpu dwt_gpu
+all: rans_gpu dwt_gpu rans_dec
 
 rans_gpu: rans_gpu.hip
+	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -o $@ $<
+
+rans_dec: rans_dec.hip
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -o $@ $<
 
 # the CPU reference transform is linked in so the GPU is validated against the real spec

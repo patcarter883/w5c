@@ -1,3 +1,4 @@
 rans_gpu
+rans_dec
 dwt_gpu
 *.o

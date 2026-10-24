@@ -44,7 +44,36 @@ matter here (the transform is ~0.03% of the codec budget) but it is why this is 
 Floor is ~0.4 ms across all sizes: 10 kernel launches of overhead. Irrelevant at HD/4K,
 dominant below ~320×240.
 
-## Entropy correctness
+## Entropy decode
+
+```
+streams 8428 | symbols 7927243 | bitstream 5315830 bytes | tables 64 (280 KB)
+validation: symbol streams identical to reference (0/8428 streams differ, 0 errors)
+CPU single core decode: 0.206 Gsym/s (38.4 ms)
+GPU: 5.17 Gsym/s at the frame's natural 8428 streams  (25× a core)
+```
+
+Decodes the reference bitstreams and reproduces the reference **symbol streams exactly** —
+so encode and decode are now both pinned against the C reference, independently.
+
+Decode tables are 280 KB per frame (4 KB slot table × 64 context-tables) so they live in
+global memory, not `__constant__`. That is the main structural difference from the encoder.
+
+### Two things worth flagging
+
+1. **Decode is ~1.8× encode at the same stream count** (5.17 vs 2.93 Gsym/s). Part of that is
+   division (decode has none) but the comparison is confounded: my encoder also does a
+   backward byte write plus a copy-to-front pass to realign the stream, which decode does not.
+   Removing that pass (store each stream at a fixed stride with its data at the end, record
+   the length) is the obvious next optimisation, and it is not a division change.
+2. **The scaling curve is reproducible but not monotonic**: rep=1 → 5.2, rep=2 → 9.4,
+   rep=4 → 6.5 Gsym/s, all three repeats within ~2%. A 40% drop when *adding* parallel work
+   is not normal latency behaviour and I do not have an explanation — candidates are per-rep
+   device allocation churn in the harness or L2 pressure from the 280 KB table probe pattern.
+   It needs an idle card to characterise. Do not read that curve as a hardware property yet.
+
+
+## Entropy encode
 
 ```
 streams 8428 | symbols 7927243 | tables 64 | ref bytes 5315830 | max stream 5347
