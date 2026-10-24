@@ -98,6 +98,26 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     int wav = 0;
     if (const char *e = getenv("W5C_WAV")) wav = (e[0] == 'h' || e[0] == 'H') ? 1 : atoi(e);
 
+    /* Haar's detail coefficient is b - a, which needs one more bit than the input. At 10-bit
+       that is 11 bits and comfortably inside int16, but a full-range 16-bit source overflows and
+       the wrap corrupts the reconstruction. 5/3 does not have this problem: its detail is bounded
+       by the input range rather than twice it. */
+    if (wav) {
+        long mx = 0;
+        for (int i = 0; i < np; i++)
+            for (size_t k = 0; k < img[i].size(); k++) {
+                long a = img[i][k] < 0 ? -(long)img[i][k] : img[i][k];
+                if (a > mx) mx = a;
+            }
+        if (mx > 16383) {
+            fprintf(stderr,
+                "haar: source samples reach %ld, which exceeds 14 bits; the detail coefficient "
+                "would overflow int16. Use W5C_WAV=5 (default) for this input.\n", mx);
+            return 1;
+        }
+    }
+
+
     /* W5C_REPEAT repeats the whole encode in-process. A single run pays ~2 ms of cold start
        (first kernel of each type), which is meaningless for a codec that runs per frame. */
     int rep = 1;

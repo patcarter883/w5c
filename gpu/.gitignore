@@ -6,3 +6,6 @@ codec_gpu
 *.o
 o_*.mkv
 o_*.jxs
+*.s
+*.bc
+wavtest

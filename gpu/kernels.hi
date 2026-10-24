@@ -43,18 +43,54 @@ struct dtab_t {                 /* decoder: adds the 4 KB slot lookup */
 /* --------------------------------------------------------------- transform */
 typedef short v2s __attribute__((ext_vector_type(2)));
 
+/* Which coefficients of this group become significant at plane p. Shared by both iterate
+   paths in the symboliser. */
+__device__ __forceinline__ int group_newly(const int16_t *row, int x, int i, int n, int bw, int pw,
+                                           int p, const uint32_t *nw, int nwidx)
+{
+    if (nw) return (int)((nw[nwidx] >> (i >> 5)) & 1u);
+    const int16_t *sr = row;
+    int sx = x;
+    int rem = n - i; if (rem > 32) rem = 32;
+    for (int k = 0; k < rem; k++) {
+        int v = sr[sx]; int m = v < 0 ? -v : v;
+        if (!(m >> (p + 1)) && ((m >> p) & 1)) return 1;
+        if (++sx == bw) { sx = 0; sr += pw; }
+    }
+    return 0;
+}
+
+/* Emitting one coefficient's bit for one context. This is the whole branch structure of the
+   symboliser, written once. */
+__device__ __forceinline__ void sym_coef(int v, int m, int p, int ctx, int newly,
+                                         int emit, uint8_t *ob, uint32_t &nb)
+{
+    if (m >> (p + 1)) {
+        if (ctx == 3) {
+            if (emit && ((m >> p) & 1)) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+            nb++;
+        }
+    } else if (newly) {
+        int bit = (m >> p) & 1;
+        if (ctx == 1) {
+            if (emit && bit) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+            nb++;
+        } else if (ctx == 2 && bit) {
+            if (emit && v < 0) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+            nb++;
+        }
+    }
+}
+
 /* Two int16 coefficients per 32-bit register: v_pk_add_u16 / v_pk_ashrrev_i16 are single
    instructions on gfx1201, so a contiguous pair costs one load and one shift instead of two. */
-__device__ __forceinline__ v2s v2abs(v2s v)
+/* Magnitudes must be int, not int16: |(-32768)| is 32768 and does not fit in a short, which
+   made the packed path disagree with the scalar path on exactly one input value. */
+__device__ __forceinline__ void v2abs(int &m0, int &m1, v2s v)
 {
-    /* per-lane, not a vector literal: (v2s)(a, b) does not build the vector it looks like it
-       should, and the mistake was invisible in desymbolise because reconstructed magnitudes are
-       never negative there. */
-    v2s r;
     int a = v[0], b = v[1];
-    r[0] = (short)(a < 0 ? -a : a);
-    r[1] = (short)(b < 0 ? -b : b);
-    return r;
+    m0 = a < 0 ? -a : a;
+    m1 = b < 0 ? -b : b;
 }
 
 /* The classification of one coefficient. Both the packed and the scalar classify loops call
@@ -426,41 +462,32 @@ __global__ void k_sym(const sdesc * __restrict__ d,
         int i = 0;
         for (int y = 0; y < bh; y++) {
             const int16_t *row = base + y * pw;
-            for (int x = 0; x < bw; x++, i++) {
+            int x = 0;
+            /* One iteration body. The packed path only changes how fast the row advances: it
+               runs this twice per vector load, so the branch logic stays in one place. */
+            auto step = [&](int xa, int v, int m) {
                 if ((i & 31) == 0) {
-                    if (nw) newly = (int)((nw[sd.bi * 16 + p] >> (i >> 5)) & 1u);
-                    else {
-                        newly = 0;
-                        const int16_t *sr = row; int sx = x;
-                        int rem = n - i; if (rem > 32) rem = 32;
-                        for (int k2 = 0; k2 < rem; k2++) {
-                            int v2 = sr[sx]; int m2 = v2 < 0 ? -v2 : v2;
-                            if (!(m2 >> (p + 1)) && ((m2 >> p) & 1)) { newly = 1; break; }
-                            if (++sx == bw) { sx = 0; sr += pw; }
-                        }
-                    }
+                    newly = group_newly(row, xa, i, n, bw, pw, p, nw, sd.bi * 16 + p);
                     if (ctx == 0) {
                         if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
                         nb++;
                     }
                 }
-                if (ctx == 0) continue;
-                int v = row[x];
-                int m = v < 0 ? -v : v;
-                if (m >> (p + 1)) {
-                    if (ctx == 3) {
-                        if (emit && ((m >> p) & 1)) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    }
-                } else if (newly) {
-                    int bit = (m >> p) & 1;
-                    if (ctx == 1) {
-                        if (emit && bit) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    } else if (ctx == 2 && bit) {
-                        if (emit && v < 0) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    }
+                i++;
+                if (ctx != 0) sym_coef(v, m, p, ctx, newly, emit, ob, nb);
+            };
+            if (ctx != 0 && (bw & 1) == 0) {
+                for (; x < bw; x += 2) {
+                    v2s raw = *(const v2s *)&row[x];
+                    int m0, m1;
+                    v2abs(m0, m1, raw);
+                    step(x, raw[0], m0);
+                    step(x + 1, raw[1], m1);
+                }
+            } else {
+                for (; x < bw; x++) {
+                    int v = row[x];
+                    step(x, v, v < 0 ? -v : v);
                 }
             }
         }
@@ -696,9 +723,10 @@ __global__ void k_desym_w(const uint8_t * __restrict__ bits,
             /* whole rows, contiguous: two coefficients per load, arithmetic packed */
             int16_t *rp = base + (size_t)cy * pw;
             for (int k = 0; k < cnt; k += 2) {
-                v2s m = v2abs(*(const v2s *)&rp[k]);
-                classify(m[0], p, newly, k, amask, qmask, csig, cref);
-                classify(m[1], p, newly, k + 1, amask, qmask, csig, cref);
+                int m0, m1;
+                v2abs(m0, m1, *(const v2s *)&rp[k]);
+                classify(m0, p, newly, k, amask, qmask, csig, cref);
+                classify(m1, p, newly, k + 1, amask, qmask, csig, cref);
             }
         } else {
             int16_t *rp = base + (size_t)cy * pw;
