@@ -22,6 +22,9 @@ This file exists so that anyone picking it up knows exactly what they are gettin
   RX 9070 XT. Full block-size trade curve and stage timings in `gpu/README.md`.
 - **Specified.** `SPEC.md` defines the bitstream independently of the implementation.
 - **Audited.** `IP_AUDIT.md` records the prior art and the claim boundaries.
+- **In a pipeline.** `gstreamer/` provides `w5cenc`, `w5cdec` and `w5cparse`, verified bit-exact
+  through `gst-launch` at 320x240, 1080p, multi-frame, and file round trips
+  (`gstreamer/test-pipeline.sh`).
 
 ## What is not done
 
@@ -31,7 +34,6 @@ Ordered roughly by how much they block adoption.
 |---|---|
 | Container integration | Output is a raw `.w5c` file. No Matroska, no MXF, no RTP payload, no muxer anywhere. Nothing can read it except this code. |
 | FFmpeg decoder | No `libavcodec` integration. FFmpeg is where a codec becomes usable; without it, adoption means writing C against `SPEC.md`. |
-| GStreamer element | No `gstw5cenc`/`gstw5cdec`. This community evaluates everything through `gst-launch`. |
 | OBS plugin or output | Not usable for capture as it stands. |
 | Any non-HIP backend | HIP/ROCm only. No Vulkan compute, no CUDA, no CPU encoder beyond the slow scalar reference. |
 | Rate control | Lossless only, fixed rate is whatever the content produces. |
@@ -61,15 +63,18 @@ obvious:
 
 In the order that removes the most friction:
 
-1. A GStreamer element. Highest value per unit effort: it makes the codec testable with a one-line
-   pipeline, which is how that community decides whether to care.
-2. An FFmpeg decoder. That is what makes it reachable at all for most users, and it is also the point
-   at which the specification gets genuinely tested by someone other than its author.
-3. A container binding (Matroska is the least effort) so files are playable and muxable.
-4. CI running `ref/` only, which needs no GPU and would catch a broken change on any runner.
+1. An FFmpeg decoder. That is what makes it reachable for most users, and the point at which the
+   specification gets tested by someone other than its author. It is also the largest single piece
+   of work left.
+2. A container binding (Matroska is the least effort) so files are playable without `w5cparse`.
+3. CI running `ref/` only, which needs no GPU and would catch a broken change on any runner. The
+   GStreamer tests need a GPU, so they stay local.
+
+Done since this file was first written: the GStreamer elements (`gstreamer/`).
 
 ## Honest summary
 
 The interesting parts — the transform schedule, the warp-parallel entropy stage, the measured
-trade-offs — are done and verified. The boring parts that make a codec usable by other people are
-not. That is the gap, and it is a weeks-of-work gap, not a fundamental one.
+trade-offs — are done and verified, and the codec can now be run inside a GStreamer pipeline rather
+than only through a CLI. What is still missing is the reach: an FFmpeg decoder, and a container
+binding so files do not need `w5cparse`. That is a weeks-of-work gap, not a fundamental one.

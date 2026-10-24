@@ -68,6 +68,30 @@ architecture-specific intrinsic beyond the warp shuffle.
 Environment variables: `W5C_BLK` (code-block size, default 32), `W5C_SLICE` (slice height in lines,
 default 0 = whole frame), `W5C_REPEAT` (in-process repeats, for steady-state timing).
 
+## GStreamer
+
+`gstreamer/` builds `w5cenc`, `w5cdec`, and `w5cparse` (which frames a file back into containers):
+
+```
+make -C gstreamer && make -C gstreamer install
+
+gst-launch-1.0 videotestsrc ! video/x-raw,format=I422_10LE,width=1920,height=1080 \
+  ! w5cenc ! w5cdec ! autovideosink
+```
+
+Encoding to a file and playing it back:
+
+```
+gst-launch-1.0 videotestsrc num-buffers=250 \
+  ! video/x-raw,format=I422_10LE,width=1920,height=1080,framerate=25/1 \
+  ! w5cenc ! filesink location=clip.w5c
+
+gst-launch-1.0 filesrc location=clip.w5c ! w5cparse ! w5cdec ! autovideosink
+```
+
+`gstreamer/test-pipeline.sh` checks all of these bit-exactly. Properties, contract and limits are in
+`gstreamer/README.md`; the notable ones are one container per buffer, no seeking, and no muxing.
+
 ## Test
 
 ```
@@ -109,6 +133,7 @@ Apache-2.0; see `LICENSE`. Contributions require DCO sign-off; see `CONTRIBUTING
 ```
 ref/          scalar C reference codec — normative for correctness
 gpu/          HIP implementation, CLI and stage harnesses
+gstreamer/    GStreamer elements: w5cenc, w5cdec, w5cparse
 docs/         microarchitecture notes, rANS formulation
 tests/        synthetic source generator, bit-exact regression script
 SPEC.md       bitstream specification
@@ -119,6 +144,7 @@ IP_AUDIT.md   prior art, claim-boundary analysis, do-not-adopt list
 
 - **`SPEC.md`** — the bitstream, normative, independent of the implementation.
 - **`gpu/README.md`** — per-stage measurements, including optimisations that were tried and reverted.
+- **`gstreamer/README.md`** — element usage, the buffer contract, and what the plugin does not do.
 - **`IP_AUDIT.md`** — provenance, claim boundaries, and what not to implement.
 - **`docs/microarchitecture.md`** — why it is shaped this way on RDNA.
 - **`docs/rANS_formulation.md`** — the entropy state machine and its trade-offs.
