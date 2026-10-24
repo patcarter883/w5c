@@ -302,37 +302,39 @@ __global__ void k_sym(const sdesc * __restrict__ d,
     if (s >= nstreams) return;
 
     sdesc sd = d[s];
-    int bw = sd.bw, bh = sd.bh, n = bw * bh, ctx = sd.ctx;
+    int bw = sd.bw, bh = sd.bh, n = bw * bh, ctx = sd.ctx, pw = sd.pw;
     uint8_t *ob = emit ? out + boff[s] : nullptr;
+    const int16_t *base = sd.pl + (size_t)sd.y0 * pw + sd.x0;
     uint32_t nb = 0;
+    int newly = 0;
 
+    /* Raster walk with a row pointer: address arithmetic is one add per row, not a
+       64-bit multiply per coefficient. Groups are 32 raster-ordered coefficients. */
     for (int p = sd.mb - 1; p >= 0; p--) {
-        int gx = 0, gy = 0;
-        for (int g0 = 0; g0 < n; g0 += 32) {
-            int g1 = g0 + 32 < n ? g0 + 32 : n;
-
-            int newly = 0;
-            {
-                int cx = gx, cy = gy;
-                for (int i = g0; i < g1; i++) {
-                    int v = blk_at(sd.pl, sd.pw, sd.y0, sd.x0, cx, cy);
-                    int m = v < 0 ? -v : v;
-                    if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
-                    if (++cx == bw) { cx = 0; cy++; }
+        int i = 0;
+        for (int y = 0; y < bh; y++) {
+            const int16_t *row = base + (size_t)y * pw;
+            for (int x = 0; x < bw; x++, i++) {
+                if ((i & 31) == 0) {
+                    /* does any coefficient of this group become significant at p? */
+                    newly = 0;
+                    const int16_t *sr = row;
+                    int sx = x;
+                    int rem = n - i; if (rem > 32) rem = 32;
+                    for (int k = 0; k < rem; k++) {
+                        int v = sr[sx];
+                        int m = v < 0 ? -v : v;
+                        if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
+                        if (++sx == bw) { sx = 0; sr += pw; }
+                    }
+                    if (ctx == 0) {
+                        if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+                        nb++;
+                    }
                 }
-            }
-            if (ctx == 0) {
-                if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                nb++;
-                int cx = gx, cy = gy;
-                for (int i = g0; i < g1; i++) { if (++cx == bw) { cx = 0; cy++; } }
-                gx = cx; gy = cy;
-                continue;
-            }
+                if (ctx == 0) continue;
 
-            int cx = gx, cy = gy;
-            for (int i = g0; i < g1; i++) {
-                int v = blk_at(sd.pl, sd.pw, sd.y0, sd.x0, cx, cy);
+                int v = row[x];
                 int m = v < 0 ? -v : v;
                 if (m >> (p + 1)) {
                     if (ctx == 3) {
@@ -349,15 +351,12 @@ __global__ void k_sym(const sdesc * __restrict__ d,
                         nb++;
                     }
                 }
-                if (++cx == bw) { cx = 0; cy++; }
             }
-            gx = cx; gy = cy;
         }
     }
-    nbits[s] = nb;   /* always: the emit pass is the only walk */
+    nbits[s] = nb;
 }
 
-/* exclusive prefix sum of ceil(nbits/8) - a few thousand entries, one thread */
 __global__ void k_offsets(const uint32_t * __restrict__ nbits, uint32_t * __restrict__ off, int n)
 {
     if (blockIdx.x || threadIdx.x) return;
@@ -516,29 +515,26 @@ __global__ void k_desym(const uint8_t * __restrict__ bits,
     if (b >= nblocks) return;
 
     bdesc d = bd[b];
-    int bw = d.bw, bh = d.bh, n = bw * bh, w = d.pw;
-    int16_t *base = d.pl + (size_t)d.y0 * w + d.x0;
+    int bw = d.bw, bh = d.bh, n = bw * bh, pw = d.pw;
+    int16_t *base = d.pl + (size_t)d.y0 * pw + d.x0;
     const uint8_t *st[4];
     size_t pos[4] = {0, 0, 0, 0};
     for (int c = 0; c < 4; c++) st[c] = bits + boff[b * 4 + c];
 
+    /* the plane is zeroed by the caller, so a non-significant coefficient is already 0 */
     uint32_t sgn[MAXN / 32];
-    for (int i = 0; i < n / 32; i++) sgn[i] = 0;
-
-    /* zero the block */
-    for (int y = 0; y < bh; y++)
-        for (int x = 0; x < bw; x++) base[(size_t)y * w + x] = 0;
+    for (int i = 0; i < (n + 31) / 32; i++) sgn[i] = 0;
 
     for (int p = d.mb - 1; p >= 0; p--) {
-        int gx = 0, gy = 0;
-        for (int g0 = 0; g0 < n; g0 += 32) {
-            int g1 = g0 + 32 < n ? g0 + 32 : n;
-            int newly = (st[0][pos[0] >> 3] >> (pos[0] & 7)) & 1;
-            pos[0]++;
-
-            int cx = gx, cy = gy;
-            for (int i = g0; i < g1; i++) {
-                int16_t *q = &base[(size_t)cy * w + cx];
+        int i = 0, newly = 0;
+        for (int y = 0; y < bh; y++) {
+            int16_t *row = base + (size_t)y * pw;
+            for (int x = 0; x < bw; x++, i++) {
+                if ((i & 31) == 0) {
+                    newly = (st[0][pos[0] >> 3] >> (pos[0] & 7)) & 1;
+                    pos[0]++;
+                }
+                int16_t *q = &row[x];
                 int m = *q;
                 if (m >> (p + 1)) {
                     int bit = (st[3][pos[3] >> 3] >> (pos[3] & 7)) & 1;
@@ -554,15 +550,14 @@ __global__ void k_desym(const uint8_t * __restrict__ bits,
                         if (sg) sgn[i >> 5] |= 1u << (i & 31);
                     }
                 }
-                if (++cx == bw) { cx = 0; cy++; }
             }
-            gx = cx; gy = cy;
         }
     }
-    /* apply signs */
-    for (int y = 0, i = 0; y < bh; y++)
-        for (int x = 0; x < bw; x++, i++)
-            if ((sgn[i >> 5] >> (i & 31)) & 1) base[(size_t)y * w + x] = (int16_t)(-base[(size_t)y * w + x]);
+    for (int y = 0, k = 0; y < bh; y++) {
+        int16_t *row = base + (size_t)y * pw;
+        for (int x = 0; x < bw; x++, k++)
+            if ((sgn[k >> 5] >> (k & 31)) & 1) row[x] = (int16_t)(-row[x]);
+    }
 }
 
 #endif

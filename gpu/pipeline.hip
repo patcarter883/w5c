@@ -297,6 +297,10 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     soff[ns_total] = (uint32_t)sacc; eoff[ns_total] = (uint32_t)eacc;
     if (p + eacc > inlen) { fprintf(stderr, "d: payload overrun\n"); return false; }
 
+    /* desymbolise writes only coefficients that become significant; the rest must read 0 */
+    for (int i = 0; i < np; i++)
+        HIPCHECK(hipMemset(P[i].d, 0, (size_t)P[i].w * P[i].h * 2));
+
     float ms_dec = 0, ms_desym = 0;
     hipEvent_t e0, e1;
     HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));

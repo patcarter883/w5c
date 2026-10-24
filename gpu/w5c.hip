@@ -127,7 +127,6 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     for (int i = 0; i < np; i++) {
         size_t npx = (size_t)P[i].w * P[i].h;
         HIPCHECK(hipMalloc(&P[i].d, npx * 2));
-        HIPCHECK(hipMemset(P[i].d, 0, npx * 2));
     }
 
     stage_ms sm;

@@ -43,10 +43,10 @@ Two changes followed, worth 8-10x between them:
 
    | blk | bytes/frame | bpp | encode ms | decode ms |
    |---|---|---|---|---|
-   | 64 | 2,767,007 | 5.338 | 30.50 | 35.23 |
-   | **32** | **2,925,902** | **5.644** | **10.05** | **9.81** |
-   | 16 | 3,555,279 | 6.858 | 8.37 | 5.36 |
-   | 8 | 6,048,398 | 11.667 | 5.09 | 4.90 |
+   | 64 | 2,767,007 | 5.338 | 30.63 | 33.94 |
+   | **32** | **2,925,902** | **5.644** | **9.66** | **10.23** |
+   | 16 | 3,555,279 | 6.858 | 7.73 | 5.43 |
+   | 8 | 6,048,398 | 11.667 | 4.81 | 4.79 |
 
    All rows bit-exact. 32 is the default: 3x the speed of 64 for 6% rate.
 
@@ -54,6 +54,21 @@ Two changes followed, worth 8-10x between them:
    and on its own left the machine idle — it cost 9.3 ms for a quarter of the pixels. Batched
    into the frame, it costs what it should. At *identical* rate (blk=64, 5.338 bpp) this alone
    took the frame from 84.5/98.4 ms to 30.5/35.2 ms.
+
+### What the micro-optimisation did and did not buy
+
+Two rounds of ordinary kernel tuning were measured against this and both were **noise**:
+
+- **Row-pointer walks** (one address add per row instead of a 64-bit multiply per
+  coefficient): encode 10.17 -> 9.66 ms, decode unchanged/slightly worse. Kept because it is
+  cleaner and helps at blk=16 (8.37 -> 7.73), but it is not where the time was.
+- **Register/occupancy tuning**: `k_desym` keeps its sign bitmap in registers (68 VGPRs, zero
+  scratch, no spills). There is nothing to spill and no pressure to relieve.
+
+The lesson is the one at the top of this file: with 4,080 code-blocks and one thread walking
+each block end-to-end, the kernel is bound by the **serial dependency chain inside the walk**,
+not by instruction cost. Next coefficient's bit position depends on the previous one, so ILP is
+1 and every iteration pays full latency. More instructions or fewer, it takes the same time.
 
 Where the remaining time sits, measured with `rocprofv3` on the encode of one 4:2:2 frame
 (7.96 ms of kernel time):
