@@ -8,7 +8,8 @@ w5c is its own codec, inspired by VC-2: the wavelet arithmetic survives, and the
 is replaced with a frame's worth of independent rANS streams.
 
 **Status: MVP.** Lossless only. One frame at a time. No rate control, no muxing, no audio, no
-colour conversion.
+colour conversion. `HANDOFF.md` records what is done, what is not, and what a maintainer would need
+to build next.
 
 ## Numbers
 
