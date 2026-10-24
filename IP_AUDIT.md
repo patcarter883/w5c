@@ -124,33 +124,127 @@ Two gaps to record honestly:
 
 ---
 
-## 4. Patent numbers supplied in the brief do not resolve to the described subject matter
+## 4. Patent numbers in the original brief were unusable — corrected set verified
 
-Checked against Google Patents (primary record), with two URL forms per number:
+The numbers first supplied resolved, on Google Patents, to unrelated subject matter: US 10,129,552
+(video transcoding rate control), US 11,233,522 (image-sensor SAR ADC) and US 9,119,610 (an
+orthopaedic surgical table, Mizuho OSI). No claim chart was possible against them.
 
-| Number in brief | Described as | Actual title of record |
+A corrected list was supplied and **independently verified** here against Google Patents. All eight
+are real and on-topic. Two titles in the corrected list are slightly off, recorded so the register
+is accurate:
+
+| Number | Title of record | As described in the corrected list |
 |---|---|---|
-| US 10,129,552 B2 | intoPIX — line buffers | *Method and system for rate control during video transcoding* |
-| US 11,233,522 B2 | Microsoft — rANS / entropy coding | *High-speed successive approximation analog-to-digital converter with improved mismatch tolerance* |
-| US 9,119,610 B2 | Realtime Data LLC — compression | *Medical table having controlled movement and method of use* |
-
-None of the three concerns wavelet coding, entropy coding, or GPU data movement. **A claim-boundary
-audit cannot be performed against them**, and the prior-art matrix above cannot be turned into an
-invalidity contention without the correct numbers and their granted claims.
-
-Consequence: the T1–T4 "steer clear of" objectives are unverified. On the code facts in §1 and §2,
-targets T2 and T4 describe functionality that does not exist here, and T1's line-buffer element has
-no structural counterpart — but that is a statement about *this codebase*, not an opinion on any
-patent's scope.
+| US 11,234,023 B2 | Features of range asymmetric number system encoding and decoding | "Features of rANS encoding and decoding" — **matches** (RANS = range asymmetric number system) |
+| US 8,934,535 B2 | Systems and methods for video and audio data storage and distribution | matches |
+| US 8,867,610 B2 | System and methods for video and audio data distribution | matches |
+| US 7,415,530 B2 | System and methods for accelerated data storage and retrieval | matches |
+| US 8,378,862 B2 | Method and device for compression of binary sequences by grouping multiple symbols | described as "Efficient Data Compression" — **title differs** |
+| US 8,392,598 B2 | Methods and apparatus to facilitate client controlled sessionless adaptation | described as "Client-side bandwidth adaptation for streaming media" — **title differs in substance** |
+| US 8,832,297 B2 | Systems and methods for performing multiphase adaptive bitrate streaming | matches |
+| US 6,650,327 B1 | Display system having floating point rasterization and floating point framebuffering | matches; filed ~2000, expired |
 
 ---
 
-## 5. To complete a claim-boundary audit properly
+## 5. Claim-level analysis of the two patents that bear on this codebase
 
-1. Obtain the correct patent numbers (or the intended titles) and the **granted claim text** for
-   each, plus the priority date and any continuations.
-2. Map each independent claim element to a specific source location, or record its absence.
-3. Re-anchor prior art against the real priority dates — in particular ryg_rans (Feb 2014) only
-   works as prior art for claims later than that; for earlier ones the anchor is Duda (Nov 2013)
-   and the 2013 ANS material.
-4. Have counsel review; validity and infringement are legal conclusions.
+Claims read from the granted text on Google Patents. Element-by-element mapping against source.
+This is a technical reading, not claim construction.
+
+### 5.1 US 11,234,023 B2 (Microsoft) — rANS encoding/decoding
+
+Three independent claims (1 system, 19 method, 20 CRM), and **all three carry the same
+limitation**: a "two-phase structure for RANS decoding operations" in which
+
+1. the state update in phase one is *selective* and depends on "whether or not an output symbol
+   from a previous iteration was generated", using probability information for the **previous**
+   symbol; and
+2. the symbol for the current iteration is generated in phase two only if "the state ... includes
+   sufficient information", i.e. the state exceeds a threshold — so generation is deferred and
+   predicated.
+
+Our decoder does neither. Both the reference and GPU loops are single-phase and unconditional:
+
+```
+slot = x & (RSZ-1);              // DecGet
+sym  = table[slot];              // cum2sym
+x    = freq[sym]*(x>>RSB) + slot - start[sym];   // DecAdvanceStep
+while (x < RANS_L) x = (x<<8)|byte;              // DecRenorm
+```
+
+`ref/codec.c:182-201`, `gpu/kernels.hi` (`k_dec`). The symbol is produced from the current state on
+every iteration; the update uses the *current* symbol's parameters; there is no threshold test
+gating generation and no previous-iteration predicate. This is the ordering published in
+`ryg_rans` (Giesen, Feb 2014), which post-dates Duda's ANS (arXiv:1311.2540, Nov 2013).
+
+**Distinguishing element: the two-phase deferred/predicated structure. Absent here.**
+
+The fragment-level features that would otherwise be uncomfortable — dependent claim 4's "syntax
+element that indicates whether or not the state ... is to be flushed and re-initialized" and
+"selection of a static probability model from among multiple available static probability models"
+— are exactly the kind of thing this codec does (per-stream independent 4-byte flush; per-stream
+table index). But claim 4 depends on claim 2, which depends on claim 1. **A dependent claim cannot
+be infringed without its independent claim.** That is the whole margin here, and it is worth
+recording plainly: the `fragment` concepts themselves are a close match to our design; the
+independent claims are saved only by the hardware two-phase pipelining limitation.
+
+### 5.2 US 8,934,535 B2 (Realtime Data) — the closest match in the set
+
+Claim 1 recites: determining a parameter or attribute of at least a portion of a data block having
+audio or video data; **selecting an access profile from among a plurality of access profiles based
+upon the determined parameter or attribute**; and compressing with one or more compressors using
+asymmetric data compression and information from the selected access profile, that information
+being indicative of the one or more compressors to apply.
+
+Mapped against this tree: we determine an attribute of each portion (which subband and context a
+code-block belongs to), we select a compression configuration on that basis (one of 64
+per-subband/per-context distributions), and we compress with rANS — an asymmetric coder. Three of
+four elements have counterparts.
+
+**Correction to the brief's framing.** The instruction was to ensure "no dynamic throughput
+feedback". Claim 1 does not recite bandwidth, throughput or channel feedback at all — that element
+is in the specification and in sibling claims, not in claim 1. So the absence of a feedback loop
+here does **not** dispose of claim 1; it addresses something claim 1 does not require.
+
+**The distinguishing element is compressor selection, not model derivation.** Claim 1 requires the
+selected profile to indicate *which of several compressors* to apply to the block. This codec has
+exactly one compressor — rANS — and what varies per subband is the probability model, which is
+*measured from the frame and transmitted*, not selected from a plurality of stored profiles. That
+is a real distinction, but it is argument, not a clean clearance, and it turns on how "access
+profile" and "compressor" are construed.
+
+**This is the one item in the audit I would put in front of counsel.**
+
+### 5.3 US 8,378,862 B2 (Malikie) — no counterpart
+
+Claim 1 is a context-modelled **2^L-ary encoding tree** coder: select a 2^L-ary tree per context
+state, append length-L strings, traverse one level per string, and **update the context state based
+on the symbols**. This codec has no tree-structured variable-length coder and no adaptive context
+state updating during decode — tables are static per frame and rANS is arithmetic, not tree
+traversal. Our grouping of bits into 6-bit symbols is plain bit packing, not an L-ary tree walk.
+
+### 5.4 The remaining four — no structural counterpart
+
+- **US 8,867,610** / **US 7,415,530** (Realtime Data, data distribution and accelerated storage):
+  storage/transmission architectures, no counterpart in an intra codec.
+- **US 8,392,598** (sessionless client-controlled adaptation) and **US 8,832,297** (multiphase
+  adaptive bitrate streaming): transport/ABR — this codec has no adaptive streaming control loop,
+  no client signalling and no bitrate ladder.
+- **US 6,650,327** (floating-point rasterisation/framebuffering, SGI/Graphics Properties Holdings):
+  GPU rasterisation. Nothing here touches texture pipelines; the codec never uses a graphics
+  pipeline abstraction. Also expired (filed ~2000).
+
+---
+
+## 6. Risk ranking and what counsel needs
+
+| Rank | Item | Basis |
+|---|---|---|
+| 1 | US 8,934,535 claim 1 | Attribute-driven selection of a compression configuration per portion, followed by an asymmetric coder. Distinguishable on "which compressor" vs "which model", and on measured-and-transmitted vs selected-from-stored-profiles — but it is argument. |
+| 2 | US 11,234,023 claims 2-4 (dependent) | Per-stream flush/re-init and static-model selection per fragment map closely to this design; saved only by the two-phase limitation in claims 1/19/20. |
+| — | Everything else in the set | No counterpart, or expired. |
+
+To finish properly: the file histories (continuations, reexaminations, terminal disclaimers) for
+8,934,535 and 11,234,023; the priority dates, since ryg_rans (Feb 2014) is not prior art to
+anything claiming earlier; and counsel's construction of "access profile" and "compressor".
