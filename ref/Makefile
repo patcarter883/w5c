@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
+CFLAGS  ?= -O3 -march=native -std=c11 -Wall -Wextra
 LDLIBS  ?= -lm
 
 SRC = codec.c wavelet.c

@@ -30,11 +30,11 @@ codec_gpu: codec_gpu.o codec_ref.o wavelet_ref.o
 	$(HIP) -o $@ $^
 
 codec_ref.o: $(REF)/codec.c $(REF)/codec.h
-	gcc -O2 -std=c11 -c -o $@ $<
+	gcc -O3 -march=native -std=c11 -c -o $@ $<
 
 # the CPU reference transform is linked in so the GPU is validated against the real spec
 wavelet_ref.o: $(REF)/wavelet.c
-	gcc -O2 -std=c11 -c -o $@ $<
+	gcc -O3 -march=native -std=c11 -c -o $@ $<
 
 dwt_gpu.o: dwt_gpu.hip $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<

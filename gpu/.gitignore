@@ -4,3 +4,5 @@ dwt_gpu
 sym_gpu
 codec_gpu
 *.o
+o_*.mkv
+o_*.jxs

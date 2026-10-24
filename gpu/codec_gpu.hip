@@ -413,6 +413,11 @@ int main(int argc, char **argv)
            ms_sym, ms_rd);
     printf("bitrate %.3f bpp   equivalent %.1f fps\n",
            (double)container.len * 8.0 / (double)npx, 1000.0 / gpu_ms);
+    double enc_only = ms_fwd + ms_symemit + ms_pack + ms_tables + ms_enc;
+    double dec_only = ms_dec + ms_desym + ms_inv;
+    printf("encode-only %.3f ms   decode-only %.3f ms\n", enc_only, dec_only);
+    printf("RESULT bytes=%zu ms=%.3f enc=%.3f dec=%.3f px=%zu\n",
+           container.len, gpu_ms, enc_only, dec_only, npx);
     printf("\n%s\n", pix_ok ? "END-TO-END LOSSLESS, BIT-EXACT" : "*** FAILED ***");
     return pix_ok ? 0 : 1;
 }

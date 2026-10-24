@@ -137,6 +137,61 @@ it was 30.1 ms until I replaced the per-coefficient `i / bw` / `i % bw` with an 
 cursor: an integer division in that inner loop cost 2x. The remaining parallelism is genuinely
 harder here, because the walk is sequential within a block by construction.
 
+## Head-to-head: VC-2, SVT-JPEG-XS, DNxHR, FFV1
+
+`./compare.sh 30` — identical source for every codec: 30 frames of 1920x1080 **yuv422p10le**
+converted from real camera stills. Per-frame figures. bpp is **bits per sample** (2 samples
+per pixel in 4:2:2), so all rows are on the same basis.
+
+| codec | bytes/frame | bpp | encode ms/frame | quality |
+|---|---|---|---|---|
+| SVT-JPEG-XS @2.0 bits/luma-px | 518,400 | 1.000 | **9.19** | 40.37 dB |
+| SVT-JPEG-XS @3.0 bits/luma-px | 777,600 | 1.500 | 10.63 | 43.43 dB |
+| **this codec (GPU)** | **2,772,131** | **5.347** | **83.54** | **lossless** |
+| DNxHR HQX | 917,569 | 1.770 | 34.08 | 31.77 dB |
+| VC-2 5/3 (tol=0) | 2,492,808 | 4.809 | 12.18 | 31.81 dB |
+| FFV1 level 3 | 2,451,713 | 4.729 | 30.74 | **lossless** |
+
+Encode-only and decode-only: **83.54 / 89.95 ms** per 4:2:2 frame (three planes).
+
+### What this actually says — it is not competitive yet
+
+1. **Rate: 13% worse than FFV1**, the true lossless comparison (5.347 vs 4.729 bpp). FFV1 uses
+   a context-modelled range coder; this codec has no context modelling beyond symbol packing.
+   That gap is the price of the parallel-friendly symbolisation, and it is now quantified on
+   real content rather than estimated.
+2. **Speed: slowest of the six, on a GPU.** 83.5 ms vs 9-34 ms for everything else. FFV1 does
+   it in 30.7 ms on the CPU. The GPU is not paying for itself yet, and the reason is already
+   measured: symbolise and desymbolise are *one thread per code-block*, so the machine runs
+   one wave deep (desym alone is 26-32 ms of the 83.5).
+3. **SVT-JPEG-XS is the real bar and it is far ahead**: 43.4 dB at 1.5 bpp in 10.6 ms. That is
+   what a mezzanine codec designed for SIMD looks like. Beating it needs both context modelling
+   and real parallelism, not either.
+4. **The VC-2 row is unflattering to VC-2, not to this codec**: ffmpeg's encoder needs 4.809 bpp
+   to reach 31.8 dB, which is a basic encoder, not a fair picture of VC-2's potential. Note the
+   comparison is against *ffmpeg's* VC-2, not a tuned implementation.
+
+### Measurement notes (the numbers moved a lot, here is why)
+
+- The card was genuinely idle for these runs (0% use, no KFD processes), having earlier been
+  shared with two inference tenants.
+- A *single* pipeline run is not a valid measurement: the same input measured 44.3 ms once and
+  52.7 ms on the next run. Eight back-to-back runs converge to 52.1-52.9 ms, so the harness
+  takes the best of 5 and the comparison uses that. `rocm-smi --showclocks` reports sclk 0 MHz
+  on this card, so clocks cannot be normalised or recorded — the numbers are as-measured.
+- Content matters more than expected: real camera frames cost 52 ms where synthetic
+  "natural-ish" cost 30 ms, because real content has more significant coefficients and a
+  higher bitplane count.
+
+### The two fixes, in order of payoff
+
+1. **Desymbolise is 30-36% of the frame** and is one thread per block (253-506 work-items).
+   The walk is sequential *within* a block by construction, so the fix is warp-cooperative:
+   32 lanes covering a significance group, ballot for the flags, warp scan for bit positions.
+2. **Context modelling** for the rate. The 13% FFV1 gap is context; the parallel-friendly way
+   to buy some of it is per-subband *and* per-bitplane-group tables (cheap at 6-bit symbols)
+   plus a separate table per significance-group position.
+
 ## Entropy decode
 
 ```
