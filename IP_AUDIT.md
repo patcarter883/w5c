@@ -106,8 +106,10 @@ task's stated boundary.
 | 7 | 32-lane warp prefix scan (`__shfl_up` Hillis-Steele) | Hillis & Steele, *Data parallel algorithms*, CACM 29(12); Kogge & Stone | 1986 / 1973 (pre-2014) |
 | 8 | Bitplane significance coding with per-group activity signalling | Taubman, *High performance scalable image compression with EBCOT*, IEEE TIP 9(7); Taubman & Marcellin, *JPEG2000* | 2000 / 2002 (pre-2014) |
 | 9 | Per-subband context partitioning of an entropy coder | EBCOT / JPEG 2000 as above; VC-2 | 2000–2008 (pre-2014) |
-| 10 | rANS: state, renormalisation, `[L, bL−1]` interval | Duda, *Asymmetric numeral systems*, arXiv:1311.2540 | Nov 2013 (pre-2014) |
+| 10 | ANS/rANS: state, renormalisation, `[L, bL−1]` interval | Duda, *Asymmetric numeral systems*, **arXiv:0902.0271** (first version) | **2 Feb 2009** (pre-2014) |
+| 10a | Extended rANS formulation and interleaving | Duda, arXiv:1311.2540 | Nov 2013 (pre-2014) |
 | 11 | Byte-wise rANS with `x_max`, division encode, slot-table decode | Giesen, `ryg_rans` (public domain), README signed Feb 2014 | Feb 2014 |
+| 11a | Independent byte-rANS implementation in a production codec (CRAM) | Bonfield, `rans_static` in htslib | 2014 |
 | 12 | Slot/lookup-table rANS decode | as #11 | Feb 2014 |
 | 13 | Division by invariant integer via reciprocal multiply | Granlund & Montgomery, PLDI | 1994 (pre-2014) |
 | 14 | Interleaved multi-state rANS for ILP | Duda, arXiv:1311.2540 (describes interleaving) | Nov 2013 (pre-2014) |
@@ -123,6 +125,26 @@ Two gaps to record honestly:
   anyone's claim element on its own.
 
 ---
+
+## 3.1 Chronological anchor
+
+The dates above, in order, are the whole prior-art story in one place:
+
+| Year | Anchor |
+|---|---|
+| 1988 | LeGall & Tabatabai — 5/3 symmetric short-kernel filter bank |
+| 1993 | Shapiro — EZW, sign coded as a distinct element from magnitude |
+| 1996-98 | Sweldens — lifting factorisation; Calderbank et al. — integer-to-integer lifting |
+| 2000 | Taubman — EBCOT bitplane coding with per-context subband models |
+| 2000-02 | JPEG 2000 (ITU-T T.800) — reversible 5/3, whole-sample symmetric extension, tiles |
+| 2004-08 | Dirac, public specification (BBC) |
+| **2008** | **SMPTE ST 2042-1 (VC-2), first edition** — 5/3 lifting, slices, subband coding, magnitude with separable sign |
+| **2009** | **Duda, arXiv:0902.0271 — asymmetric numeral systems** |
+| 2013 | Duda, arXiv:1311.2540 — extended rANS, interleaving |
+| 2014 | Giesen, `ryg_rans` (Feb); Bonfield, `rans_static` in htslib |
+
+The two bold rows are the ones this codec actually rests on, and both predate every patent examined
+in §5 and §7 by between five and eight years.
 
 ## 4. Patent numbers in the original brief were unusable — corrected set verified
 

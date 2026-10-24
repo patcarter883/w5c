@@ -109,7 +109,7 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
         /* the transform is in place, so each repeat starts from the pristine samples */
         if (r) for (int i = 0; i < np; i++)
             HIPCHECK(hipMemcpy(P[i].d, img[i].data(), (size_t)P[i].w * P[i].h * 2, hipMemcpyHostToDevice));
-        plane_dwt_all(P, np, levels, true, &t, slice_h);
+        if (!plane_dwt_all(P, np, levels, true, &t, slice_h)) return 1;
         if (qp > 0)
             for (int i = 0; i < np; i++) {
                 subband_t sb[64];
@@ -180,7 +180,7 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     for (int r = 0; r < rep; r++) {
         float t = 0;
         if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
-        plane_dwt_all(P, np, levels, false, &t, slice_h);
+        if (!plane_dwt_all(P, np, levels, false, &t, slice_h)) return 1;
         double tot = sm.dec + sm.desym + t;
         if (r == 0 || tot < best) { best = tot; best_sm = sm; best_inv = t; }
     }

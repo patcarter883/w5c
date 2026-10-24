@@ -3,9 +3,14 @@ rans_dec
 dwt_gpu
 sym_gpu
 codec_gpu
+w5c
 *.o
 o_*.mkv
 o_*.jxs
 *.s
 *.bc
+*.hipi
+*.hipfb
+*.out
+*.out.resolution.txt
 wavtest

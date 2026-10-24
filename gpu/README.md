@@ -16,6 +16,12 @@ are the ones disclosed by VC-2 first. What the intoPIX claims add — precincts,
 modes, per-group gain and quantisation-level machinery — is deliberately **not** implemented here.
 See `../IP_AUDIT.md` §7 before adding any of them.
 
+**Licence:** Apache-2.0 (`../LICENSE`), which includes an express patent grant and terminates it for
+anyone who sues over the code. Contributions require DCO sign-off (`../CONTRIBUTING.md`).
+**Specification:** `../SPEC.md` is normative for the bitstream.
+**Verifying:** `tests/verify_lossless.sh` builds, generates a synthetic source with no external
+media, and asserts bit-exact round trips across block sizes and slice configurations.
+
 **MVP: `w5c` is the codec.** Encode a frame to a self-contained bitstream and back, bit-exactly:
 
 ```

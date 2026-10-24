@@ -258,8 +258,8 @@ int main(int argc, char **argv)
         printf("%-5d %-9zu %-9.2f %-7.0f %-11.3f %-11.3f %-8.1f\n",
                rep, n2, fill, waves, gsym, gsym2, cpu_rate > 0 ? gsym2 / cpu_rate : 0.0);
 
-        hipFree(D_sym); hipFree(D_so); hipFree(D_sl); hipFree(D_st);
-        hipFree(D_ol); hipFree(D_ca); hipFree(D_oo); hipFree(D_out);
+        (void)hipFree(D_sym); (void)hipFree(D_so); (void)hipFree(D_sl); (void)hipFree(D_st);
+        (void)hipFree(D_ol); (void)hipFree(D_ca); (void)hipFree(D_oo); (void)hipFree(D_out);
     }
 
     printf("\npeak %.3f Gsym/s at rep=%d (%.1f Msym/s per CU)\n",

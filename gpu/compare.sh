@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Head-to-head: this codec vs VC-2, SVT-JPEG-XS, DNxHR (and FFV1 as a true-lossless control).
 #
-# Content: 30 x 1920x1080 yuv422p10le frames converted from real camera stills.
+# Content: FRAMES x 1920x1080 yuv422p10le frames converted from PNG stills.
 # All codecs get the identical source. Frame counts, bitrates and timings are per frame.
 #
-#   ./compare.sh [frames]
+#   ./compare.sh [frames] [png-dir] [png-pattern]
+#
+# The source stills are not distributed with this repository. Point SRC_PNG at your own
+# images, or generate a synthetic source with tests/generate_synthetic.py.
 #
 set -u
 FRAMES=${1:-30}
 W=1920; H=1080
-D=/tmp/w5c_cmp
-GPU=/home/pat/workspace/video/gpu-wavelet-codec/gpu
-SRC_PNG=/home/pat/workspace/video/jxs-verify/frames/f_%04d.png
+D=${D:-/tmp/w5c_cmp}
+GPU=$(cd "$(dirname "$0")" && pwd)
+PNG_DIR=${2:-$PWD/frames}
+SRC_PNG=${SRC_PNG:-$PNG_DIR/${3:-f_%04d.png}}
 PX=$((W * H * 2))                      # 4:2:2: 2 samples per pixel
 FRAME_BYTES=$((W * H * 4))             # 4:2:2 = 2 samples/px x 2 bytes = 4 bytes/px
 

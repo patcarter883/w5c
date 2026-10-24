@@ -383,6 +383,15 @@ static int level_sizes(int w, int h, int levels, int *cw, int *ch)
     return nl;
 }
 
+/* Effective decomposition depth of one slice. level_sizes() stops once a dimension drops below 2,
+   so a short slice decomposes more shallowly than a tall one. Subband indices and the frame-wide
+   probability tables assume every slice agrees, so this must be equal across the whole frame. */
+static inline int slice_depth(int w, int h, int levels)
+{
+    int c[16], hh[16];
+    return level_sizes(w, h, levels, c, hh);
+}
+
 /* build encoder tables from raw frequencies; shared by every harness so the
    reciprocal and start arrays can never drift between them */
 static void build_gtabs(std::vector<gtab_t> &tabs, const std::vector<uint16_t> &freqs, uint32_t nsets)

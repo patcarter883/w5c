@@ -42,9 +42,6 @@ codec_ref.o: $(REF)/codec.c $(REF)/codec.h
 wavelet_ref.o: $(REF)/wavelet.c
 	gcc -O3 -march=native -std=c11 -c -o $@ $<
 
-dwt_gpu.o: dwt_gpu.hip $(REF)/wavelet.h
-	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
-
 dwt_gpu: dwt_gpu.o wavelet_ref.o
 	$(HIP) -o $@ $^
 

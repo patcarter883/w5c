@@ -84,7 +84,7 @@ int main(int argc, char **argv)
     stage_ms sf = {}, sc = {};
     float ms_fwd = 0, ms_inv = 0;
     plane_t PT[1] = {{d, w, h}};
-    plane_dwt_all(PT, 1, levels, true, &ms_fwd, 0);
+    if (!plane_dwt_all(PT, 1, levels, true, &ms_fwd, 0)) return 1;
 
     std::vector<int16_t> coef_gpu(npx);
     HIPCHECK(hipMemcpy(coef_gpu.data(), d, npx * 2, hipMemcpyDeviceToHost));
@@ -118,7 +118,7 @@ int main(int argc, char **argv)
            dec_ok ? "coefficients identical to reference decode" : "*** DECODE MISMATCH ***");
     if (!dec_ok) return 1;
 
-    plane_dwt_all(PT, 1, levels, false, &ms_inv, 0);
+    if (!plane_dwt_all(PT, 1, levels, false, &ms_inv, 0)) return 1;
     std::vector<int16_t> rec(npx);
     HIPCHECK(hipMemcpy(rec.data(), d, npx * 2, hipMemcpyDeviceToHost));
     int pix_ok = memcmp(rec.data(), img.data(), npx * 2) == 0;

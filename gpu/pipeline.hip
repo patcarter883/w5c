@@ -6,12 +6,14 @@
    per-plane calls made chroma cost as much as luma.
 
    Container (all integers little-endian):
-     "W5C1" | u32 np, levels, nblocks, nstreams, ntab, blk, rsv
+     "W5C1" | u32 np, levels, nblocks, nstreams, ntab, blk, slice_h
      | np    * (u32 w, u32 h)
      | ntab  * NSYM u16   frequency tables (shared by all planes)
-     | nblocks * u32      mb per code-block
-     | nstreams * (u32 nsym, u32 plen)
+     | nblocks * u8       mb per code-block
+     | nstreams * varint(nsym), varint(plen)   LEB128, 7 bits per byte
      | payload bytes, tightly packed in stream order
+   each stream payload ends with the 4-byte rANS terminal state.
+   slice_h = 0 means the frame is transformed whole. See SPEC.md.
 */
 #ifndef W5C_PIPELINE_HIP
 #define W5C_PIPELINE_HIP
@@ -77,11 +79,19 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     static plane_geom g;
     std::vector<bdesc> bds;
     std::vector<int> btab;
-    int ns_total = 0, ntab = 0;
+    int ns_total = 0, ntab = 0, nl_ref = -1;
     for (int i = 0; i < np; i++) {
         int sh = (slice_h > 0 && slice_h < P[i].h) ? slice_h : P[i].h;
         for (int y0 = 0; y0 < P[i].h; y0 += sh) {
             int hs = (P[i].h - y0 < sh) ? (P[i].h - y0) : sh;
+            int d = slice_depth(P[i].w, hs, levels);
+            if (nl_ref < 0) nl_ref = d;
+            if (d != nl_ref) {
+                fprintf(stderr, "slice_h=%d: a %d-line slice decomposes to %d levels but the frame "
+                                "already uses %d. Every slice must reach the same depth.\n",
+                        slice_h, hs, d, nl_ref);
+                return false;
+            }
             if (!plane_geometry(P[i].w, hs, levels, blk, &g)) return false;
             for (int b = 0; b < g.nblocks; b++) {
                 bdesc d = g.bd[b];
@@ -341,11 +351,19 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     static plane_geom g;
     std::vector<bdesc> bds;
     std::vector<int> btab;
-    int ns_chk = 0;
+    int ns_chk = 0, nl_ref = -1;
     for (int i = 0; i < np; i++) {
         int sh = (slice_h > 0 && slice_h < P[i].h) ? slice_h : P[i].h;
         for (int y0 = 0; y0 < P[i].h; y0 += sh) {
             int hs = (P[i].h - y0 < sh) ? (P[i].h - y0) : sh;
+            int d = slice_depth(P[i].w, hs, levels);
+            if (nl_ref < 0) nl_ref = d;
+            if (d != nl_ref) {
+                fprintf(stderr, "slice_h=%d: a %d-line slice decomposes to %d levels but the frame "
+                                "already uses %d. Every slice must reach the same depth.\n",
+                        slice_h, hs, d, nl_ref);
+                return false;
+            }
             if (!plane_geometry(P[i].w, hs, levels, blk, &g)) return false;
             for (int b = 0; b < g.nblocks; b++) {
                 bdesc d = g.bd[b];
@@ -499,7 +517,12 @@ static void split_launch(bool fwd, const int16_t *src, int16_t *dst, long y0_ste
 
    Everything runs on the default stream; per-plane streams were tried and measured as no help,
    and non-blocking streams raced the upload that feeds them. */
-static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, int slice_h)
+/* Every slice must decompose to the same depth as the frame. level_sizes() stops once a
+   dimension drops below 2, so a slice whose span is too short for `levels` would produce a
+   shallower decomposition than its neighbours, and the band geometry passed to the kernels would
+   disagree with the slice's real extents. That is not a tuning parameter - it writes past the
+   slice. Reject the configuration instead. Returns false if a slice cannot support the depth. */
+static bool plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, int slice_h)
 {
     static int16_t *scr[W5C_MAXPLANES];
     static size_t scrn[W5C_MAXPLANES];
@@ -525,6 +548,18 @@ static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, i
         }
         int cw0[16], ch0[16];
         int nl = level_sizes(P[k].w, hs[0], levels, cw0, ch0);
+        for (int t = 1; t < ns; t++) {
+            int d = slice_depth(P[k].w, hs[t], levels);
+            if (d != nl) {
+                fprintf(stderr,
+                        "slice_h=%d: a %d-line slice decomposes to %d levels but a %d-line slice "
+                        "decomposes to %d. Every slice must reach the same depth, because subband "
+                        "and table indices are frame-wide. Pick a slice height that divides the "
+                        "plane evenly (height %d, slice_h %d leaves %d lines).\n",
+                        sh, hs[0], nl, hs[t], d, P[k].h, sh, hs[t]);
+                return false;
+            }
+        }
         for (int L = 0; L < nl; L++) {
             int i = fwd ? L : nl - 1 - L;
             /* rows: positions = cw_i (width only), lines = ch_i (depends on slice height);
@@ -552,6 +587,6 @@ static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, i
     HIPCHECK(hipDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
     if (ms) *ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    return true;
 }
-
 #endif

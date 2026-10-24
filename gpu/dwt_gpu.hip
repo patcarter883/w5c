@@ -61,7 +61,7 @@ int main(int argc, char **argv)
     HIPCHECK(hipEventRecord(e0));
     float ms = 0;
     plane_t PT[1] = {{d, w, h}};
-    plane_dwt_all(PT, 1, levels, true, &ms, 0);
+    if (!plane_dwt_all(PT, 1, levels, true, &ms, 0)) return 1;
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipDeviceSynchronize());
 
@@ -83,7 +83,7 @@ int main(int argc, char **argv)
     if (diff) { printf("FAIL\n"); return 1; }
 
     HIPCHECK(hipEventRecord(e0));
-    plane_dwt_all(PT, 1, levels, false, nullptr, 0);
+    if (!plane_dwt_all(PT, 1, levels, false, nullptr, 0)) return 1;
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipDeviceSynchronize());
     float ms2 = 0; HIPCHECK(hipEventElapsedTime(&ms2, e0, e1));
