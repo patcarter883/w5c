@@ -7,18 +7,22 @@ precondition for anything on the GPU.
 ## Build and run
 
 ```
-make
-./codec_test 1920 1080 5 0     # w h levels pattern
+make                                   # builds codec_test plus SYMBITS=4/8 variants
+./codec_test 1920 1080 5 0             # synthetic: w h levels pattern(0..3)
+./codec_test 1920 1080 5 frame.y10     # real frame: raw luma plane, w*h*2 = 16-bit LE, w*h = 8-bit
+make check                             # wavelet round-trip + full synthetic matrix
 ```
-`pattern`: 0 = natural-ish (smooth + edges + grain), 1 = smooth gradient, 2 = full noise,
-3 = checkerboard. `make check` runs the whole matrix.
 
-Two coder configurations over the *same* symbolisation:
+Three coder configurations over the *same* symbolisation:
 
-- **cfg 0 — raw bit packing.** One bit per binary symbol. This is the JXS-style baseline: no
-  entropy coder, trivially parallel, deterministic.
-- **cfg 1 — static rANS** over the packed byte symbols, one stream per (code-block, context),
-  tables pooled per context and normalised to 2^12.
+- **A — raw bit packing.** One bit per binary symbol. The JXS-style baseline: no entropy
+  coder, trivially parallel, deterministic.
+- **B — static rANS, tables pooled** per context over the whole frame.
+- **C — static rANS, tables per subband**, falling back to the pooled table where a
+  (subband, context) cell has fewer than 256 symbols to model.
+
+Symbol width is a build flag: `-DSYMBITS=4..8` (default 6). See the sweep below — it is a
+real trade between modelling depth and table cost.
 
 ## Architecture as built
 
@@ -29,58 +33,87 @@ Two coder configurations over the *same* symbolisation:
   significance* flag, then per-coefficient significance bits, sign bits, and refinement bits
   for already-significant coefficients. Four binary contexts: `siggrp`, `sig`, `sign`,
   `refine`.
-- **rANS:** byte alphabet, scale 2^12, `RANS_L = 1<<23`, per-lane-independent states (one
-  stream per block per context — the same structure a GPU wave would use).
+- **rANS:** scale 2^12, `RANS_L = 1<<23`, one independent stream per (code-block, context) —
+  the same structure a GPU wave would use. Symbols are `SYMBITS` consecutive bits of one
+  context, packed LSB-first.
 - Encode and decode share **one** traversal function (`walk_block`) with a direction flag.
-  That is deliberate: two hand-written mirror implementations drift, and the drift is silent.
+  Two hand-written mirror implementations drift, and the drift is silent.
 
-## Measured (single thread, unoptimised reference, 10-bit, 5 levels)
+## Real content: symbol width × table granularity
 
-| content | cfg 0 bpp | cfg 1 bpp | rANS gain |
-|---|---|---|---|
-| natural-ish, 1080p | 5.779 | 5.199 | **10.1%** |
-| natural-ish, 4K | 5.769 | 5.181 | **10.2%** |
-| smooth gradient, 1080p | 1.402 | 0.769 | 45.1% |
-| smooth gradient, 4K | 1.144 | 0.673 | 41.2% |
-| full noise, 1080p | 11.286 | 10.887 | 3.5% |
-| full noise, 4K | 11.281 | 10.872 | 3.6% |
-| checkerboard, 1080p | 4.497 | 1.958 | 56.5% |
-| checkerboard, 4K | 4.498 | 1.904 | 57.7% |
+8 frames sampled across the 284-frame camera capture on the JXS rig (1920×1080, luma),
+5 levels, all runs bit-exact. **bpp = bits per pixel of the luma plane.**
 
-All 8 cases: coefficients and pixels **bit-exact** under both configurations.
+| symbols | table strategy | bpp | vs raw | per-subband vs pooled |
+|---|---|---|---|---|
+| — | raw bits (A) | 4.305 | — | — |
+| 4 | pooled (B) | 3.727 | −13.44% | |
+| 4 | per-subband (C) | 3.630 | −15.70% | **−2.61%** |
+| 5 | pooled | 3.683 | −14.44% | |
+| 5 | per-subband | 3.599 | −16.40% | −2.29% |
+| **6** | pooled | 3.648 | −15.26% | |
+| **6** | **per-subband** | **3.584** | **−16.76%** | **−1.77%** |
+| 7 | pooled | 3.621 | −15.91% | |
+| 7 | per-subband | 3.589 | −16.64% | −0.87% |
+| 8 | pooled | 3.598 | −16.44% | |
+| 8 | per-subband | 3.627 | −15.75% | **+0.83%** |
+
+At the default (6-bit symbols, per-subband), 10-bit content expanded from the same frames:
+A 6.262 → C 5.492 bpp (−12.3%).
 
 ### What this says
 
-1. **The ratio gain is real but content-dependent: 3.5% to 57%, ~10% on natural material.**
-   On noise there is nothing to win — the flags are near-uniform, which is exactly why raw
-   bits perform well on it. Structured content is where the skew lives, and that is where an
-   entropy coder earns its keep.
-2. **Byte-grouping beats the per-symbol entropy bound** (`siggrp`: 0.374 bit/sym achieved vs
-   0.889 bits/sym iid entropy at P(1)=0.69). The flags are *not* independent across
-   neighbours, so packing 8 of them into a byte captures correlation for free. That is cheap
-   context modelling that costs nothing in parallelism — the useful surprise of this build.
-3. **`sign` is incompressible** (1.005 bit/sym) and `refine` barely moves (0.980). Signs are
-   genuinely random. Any effort spent entropy-coding them is wasted; they should stay raw.
-4. **CPU throughput measured: 67 Msym/s encode, 176 Msym/s decode** on one 7800X3D core, for
-   an unoptimised scalar implementation. Extrapolating to 8 cores: ~0.53 Gsym/s encode.
-   4K60 4:2:2 needs ~1.0 Gsym/s. **A CPU-only entropy stage is ~2× short at 4K60** — the
-   thesis (C2) holds on measured numbers, not estimates. At 1080p60 (0.25 Gsym/s) the CPU is
-   comfortably sufficient, which is also worth knowing.
+1. **The optimum sits at 6-bit symbols with per-subband tables, and the two levers interact.**
+   Wider symbols model better (more neighbour correlation per symbol) but cost 2^SYMBITS×2
+   bytes per table; per-subband tables only 16 subbands × 4 contexts at 64×64 blocks. At 8-bit
+   symbols the tables eat more than the modelling gains (per-subband is 0.83% *worse* than
+   pooled); at 4-bit the tables are free but modelling is weak. 6 bits is the crossover.
+2. **Per-subband tables are worth 1.8% — but only because the tables are cheap.** At 8-bit
+   symbols the same idea *loses* 0.83%. Any "finer context model" claim has to be quoted
+   together with its table cost, or it is meaningless.
+3. **Real content gains more than synthetic: −16.8% vs −10.1%.** Real sensor content has
+   stronger spatial structure, so the significance flags are more skewed than my synthetic
+   "natural-ish" pattern suggested.
+4. **`sign` is incompressible** (1.005 bit/sym) and `refine` barely moves (0.980) — signs are
+   genuinely random. Context effort belongs on `siggrp` and `sig` only.
+5. **Adjacent flags are correlated, so symbol packing beats the iid entropy bound.** At 8-bit
+   symbols `siggrp` achieved 0.534 bit/sym against an iid entropy of 0.841 bits/sym at
+   P(1)=0.73. Evaluating a symbolisation by its iid entropy alone understates it badly.
+
+## CPU capacity — measured, not estimated
+
+One core, per-subband config, 8-bit 1080p frame: **163 ms to encode** → **12.7 Mcoef/s**.
+
+| target | coefficients/s | cores needed | available |
+|---|---|---|---|
+| 1080p60 luma | 124 M/s | **9.8** | 8 |
+| 4K60 4:2:0 | 747 M/s | **58.6** | 8 |
+| 4K60 4:2:2 | 995 M/s | **78.1** | 8 |
+
+A CPU-only entropy stage is short even at 1080p60 and off by an order of magnitude at 4K. The
+thesis (C2) now rests on measured wall-clock, not a rate estimate.
 
 ## Caveats — read before quoting any number
 
-- Content is **synthetic**. Real footage will sit between "natural-ish" and "gradient".
+- The 8 frames are consecutive samples of **one scene** (~9 s of one capture). The per-frame
+  spread is tiny (4.303–4.311 bpp) because the content is nearly static, so this is one real
+  scene, *not* a content distribution. More scenes are needed before treating −16.8% as
+  typical.
+- The **10-bit runs are 8-bit camera frames expanded ×4** (`format=gray10le`), so the two low
+  bitplanes are empty. That is easier to compress than genuine 10-bit sensor data. The
+  native-8-bit numbers are the trustworthy ones.
+- The capture `.ts` uses a codec stock ffmpeg cannot decode, so native 10-bit from the rig is
+  not yet available here.
 - Symbolisation is **simplified**: no Golomb-type bitplane-count coding (JXS has it), no
-  per-subband tables, no per-bitplane-group tables. Per-subband tables should widen the
-  rANS gain, since pooling LL and HH into one model wastes mass on the wrong distribution.
-- Tables are pooled **globally per context**, not per code-block.
-- The reference is **not optimised** — throughput figures are a lower bound on what a tuned
-  CPU implementation achieves, but they are the honest scalar number.
-- No CBR/quantisation yet: this is the lossless path only.
+  per-bitplane-group tables, no per-code-block tables.
+- The reference is **not optimised** — throughput is the honest scalar number, a lower bound
+  on a tuned implementation.
+- No CBR/quantisation yet: lossless path only.
 
 ## Next
 
-1. **GPU rANS kernel** and the throughput/occupancy measurement (the other half of S1).
-2. Per-subband and per-bitplane context tables.
-3. Real 10-bit content from the capture box.
+1. **GPU rANS kernel** + throughput/occupancy curve — the other half of S1, and the input to
+   the hybrid decision.
+2. More scenes (different content) before treating the ratio as settled.
+3. Per-bitplane-group contexts, now that tables are cheap.
 4. Then rate control (S2) and the head-to-head against `ffmpeg` VC-2 and SVT-JPEG-XS (S5).

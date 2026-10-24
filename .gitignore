@@ -1,4 +1,10 @@
 build/
 *.o
 ref/codec_test
+ref/codec_test4
+ref/codec_test5
+ref/codec_test6
+ref/codec_test7
+ref/codec_test8
 ref/test_wavelet
+ref/testdata/

@@ -66,35 +66,43 @@ static int br_get(const uint8_t *b, size_t nbits, size_t *pos)
 #define RSB    12
 #define RSZ    (1u << RSB)
 
+/* Bits packed per coded symbol. 8 gives the best modelling (captures neighbour
+   correlation across a whole byte) but costs 512 B per table; 4 cuts tables 16x
+   so per-subband/per-plane modelling becomes affordable. Override with -DSYMBITS=n. */
+#ifndef SYMBITS
+#define SYMBITS 6
+#endif
+#define NSYM    (1 << SYMBITS)
+
 typedef struct {
-    uint16_t freq[256];
-    uint32_t start[256];
+    uint16_t freq[NSYM];
+    uint32_t start[NSYM];
     uint8_t  slot[RSZ];
 } rtab_t;
 
-static void rtab_build(rtab_t *t, const uint32_t cnt[256])
+static void rtab_build(rtab_t *t, const uint32_t cnt[NSYM])
 {
     uint64_t tot = 0;
     int present = 0;
-    for (int i = 0; i < 256; i++) { tot += cnt[i]; if (cnt[i]) present++; }
-    uint32_t f[256];
+    for (int i = 0; i < NSYM; i++) { tot += cnt[i]; if (cnt[i]) present++; }
+    uint32_t f[NSYM];
     memset(f, 0, sizeof f);
     if (tot == 0) {
         present = 1;
         f[0] = RSZ;
     } else {
         uint64_t room = (uint64_t)RSZ - (uint64_t)present;
-        for (int i = 0; i < 256; i++)
+        for (int i = 0; i < NSYM; i++)
             if (cnt[i]) f[i] = (uint32_t)((cnt[i] * room) / tot) + 1;
     }
     uint64_t sum = 0;
-    for (int i = 0; i < 256; i++) sum += f[i];
+    for (int i = 0; i < NSYM; i++) sum += f[i];
     int i = 0;
-    while (sum > RSZ) { if (f[i] > 1) { f[i]--; sum--; } i = (i + 1) & 255; }
-    while (sum < RSZ) { if (f[i])    { f[i]++; sum++; } i = (i + 1) & 255; }
+    while (sum > RSZ) { if (f[i] > 1) { f[i]--; sum--; } i = (i + 1) % NSYM; }
+    while (sum < RSZ) { if (f[i])    { f[i]++; sum++; } i = (i + 1) % NSYM; }
 
     uint32_t acc = 0;
-    for (int k = 0; k < 256; k++) {
+    for (int k = 0; k < NSYM; k++) {
         t->freq[k]  = (uint16_t)f[k];
         t->start[k] = acc;
         for (uint32_t j = 0; j < f[k]; j++) t->slot[acc + j] = (uint8_t)k;
@@ -104,15 +112,42 @@ static void rtab_build(rtab_t *t, const uint32_t cnt[256])
 
 /* Build start/slot from an already-normalised frequency table (sums to RSZ).
    Must NOT re-normalise: that is not idempotent and silently desyncs a decoder. */
-static void rtab_from_freq(rtab_t *t, const uint16_t freq[256])
+static void rtab_from_freq(rtab_t *t, const uint16_t freq[NSYM])
 {
     uint32_t acc = 0;
-    for (int k = 0; k < 256; k++) {
+    for (int k = 0; k < NSYM; k++) {
         t->freq[k]  = freq[k];
         t->start[k] = acc;
         for (uint32_t j = 0; j < freq[k]; j++) t->slot[acc + j] = (uint8_t)k;
         acc += freq[k];
     }
+}
+
+/* Pack nbits LSB-first into SYMBITS-bit symbols. Returns symbol count. */
+static size_t pack_syms(const uint8_t *bits, size_t nbits, uint8_t *out)
+{
+    size_t ns = (nbits + SYMBITS - 1) / SYMBITS;
+    for (size_t i = 0; i < ns; i++) {
+        unsigned v = 0;
+        for (int j = 0; j < SYMBITS; j++) {
+            size_t b = i * SYMBITS + (size_t)j;
+            if (b < nbits && ((bits[b >> 3] >> (b & 7)) & 1)) v |= 1u << j;
+        }
+        out[i] = (uint8_t)v;
+    }
+    return ns;
+}
+
+static void unpack_syms(const uint8_t *syms, size_t ns, uint8_t *bits)
+{
+    size_t nbits = ns * SYMBITS;
+    memset(bits, 0, (nbits + 7) / 8);
+    for (size_t i = 0; i < ns; i++)
+        for (int j = 0; j < SYMBITS; j++)
+            if ((syms[i] >> j) & 1) {
+                size_t b = i * SYMBITS + (size_t)j;
+                bits[b >> 3] |= (uint8_t)(1u << (b & 7));
+            }
 }
 
 static size_t rans_enc(uint8_t *out, size_t cap, const rtab_t *t,
@@ -306,8 +341,11 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
 
     iobits_t io; memset(&io, 0, sizeof io);
     io.enc = 1;
-    uint32_t hist[CODEC_CTX][256];
-    memset(hist, 0, sizeof hist);
+    /* histogram per (subband, context); cfg 1 pools them at build time */
+    uint32_t (*hist)[CODEC_CTX][NSYM] = calloc((size_t)f.nsb, sizeof *hist);
+    if (!hist) return -1;
+    uint8_t *syms = malloc((size_t)BLK * BLK * 6 + 64);
+    if (!syms) { free(hist); return -1; }
     memset(st, 0, sizeof *st);
 
     /* pass 1: symbolise every block, histogram the packed byte symbols */
@@ -318,13 +356,13 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
                 int bw = f.sb[s].w - (x0 - f.sb[s].x); if (bw > BLK) bw = BLK;
                 int bh = f.sb[s].h - (y0 - f.sb[s].y); if (bh > BLK) bh = BLK;
                 int16_t *blk = block_load(&f, x0, y0, bw, bh);
-                if (!blk) { io_free(&io); return -1; }
+                if (!blk) { io_free(&io); free(hist); return -1; }
                 int mb = block_mb(blk, bw * bh);
                 io_reset(&io);
                 walk_block(&io, 1, blk, bw, bh, mb);
                 for (int c = 0; c < CODEC_CTX; c++) {
-                    size_t nb = (io.w[c].nbits + 7) / 8;
-                    for (size_t j = 0; j < nb; j++) hist[c][io.w[c].b[j]]++;
+                    size_t ns = pack_syms(io.w[c].b, io.w[c].nbits, syms);
+                    for (size_t j = 0; j < ns; j++) hist[s][c][syms[j]]++;
                     st->ctx[c].syms += io.w[c].nbits;
                     for (size_t j = 0; j < io.w[c].nbits; j++)
                         st->ctx[c].ones += (io.w[c].b[j >> 3] >> (j & 7)) & 1;
@@ -335,17 +373,38 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
             }
     }
 
-    rtab_t tab[CODEC_CTX];
-    if (cfg == 1) for (int c = 0; c < CODEC_CTX; c++) rtab_build(&tab[c], hist[c]);
+    /* Tables. cfg 1 = one set pooled over the frame; cfg 2 = one set per subband,
+       falling back to the pooled set where a cell has too few symbols to model. */
+    rtab_t pooled[CODEC_CTX];
+    rtab_t (*tab)[CODEC_CTX] = malloc(sizeof(rtab_t) * CODEC_CTX * (size_t)f.nsb);
+    if (!tab) { io_free(&io); free(hist); return -1; }
+    for (int c = 0; c < CODEC_CTX; c++) {
+        uint32_t tot[NSYM];
+        memset(tot, 0, sizeof tot);
+        for (int s = 0; s < f.nsb; s++)
+            for (int k = 0; k < NSYM; k++) tot[k] += hist[s][c][k];
+        rtab_build(&pooled[c], tot);
+    }
+    for (int s = 0; s < f.nsb; s++)
+        for (int c = 0; c < CODEC_CTX; c++) {
+            uint64_t n = 0;
+            for (int k = 0; k < NSYM; k++) n += hist[s][c][k];
+            if (cfg == 2 && n >= 256) rtab_build(&tab[s][c], hist[s][c]);
+            else                      tab[s][c] = pooled[c];
+        }
+    free(hist);
 
     /* header */
     vec_u32(out, MAGIC);
     vec_u32(out, (uint32_t)w); vec_u32(out, (uint32_t)h);
     vec_u32(out, (uint32_t)levels); vec_u32(out, (uint32_t)cfg);
     vec_u32(out, (uint32_t)tot_blocks);
-    if (cfg == 1)
-        for (int c = 0; c < CODEC_CTX; c++)
-            for (int k = 0; k < 256; k++) vec_u16(out, tab[c].freq[k]);
+    if (cfg >= 1) {
+        int nsets = (cfg == 2) ? f.nsb : 1;
+        for (int s = 0; s < nsets; s++)
+            for (int c = 0; c < CODEC_CTX; c++)
+                for (int k = 0; k < NSYM; k++) vec_u16(out, tab[s][c].freq[k]);
+    }
 
     /* pass 2: emit */
     for (int s = 0; s < f.nsb; s++) {
@@ -370,18 +429,19 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
                         st->ctx[c].bits_a += nbits[c];
                     }
                 } else {
+                    int ti = (cfg == 2) ? s : 0;
                     io_reset(&io);
                     walk_block(&io, 1, blk, bw, bh, mb);
                     vec_u8(out, (uint8_t)mb);
                     uint32_t nsym[CODEC_CTX], plen[CODEC_CTX];
                     uint8_t *tmp[CODEC_CTX] = {0};
                     for (int c = 0; c < CODEC_CTX; c++) {
-                        size_t nb = (io.w[c].nbits + 7) / 8;
-                        size_t cap = nb * 4 + 64;
+                        size_t ns = pack_syms(io.w[c].b, io.w[c].nbits, syms);
+                        size_t cap = ns * 3 + 64;
                         uint8_t *t = malloc(cap ? cap : 1);
-                        size_t sz = nb ? rans_enc(t, cap, &tab[c], io.w[c].b, nb) : 0;
-                        if (nb && !sz) { free(t); free(blk); io_free(&io); return -1; }
-                        tmp[c] = t; nsym[c] = (uint32_t)nb; plen[c] = (uint32_t)sz;
+                        size_t sz = ns ? rans_enc(t, cap, &tab[ti][c], syms, ns) : 0;
+                        if (ns && !sz) { free(t); free(blk); io_free(&io); free(tab); free(syms); return -1; }
+                        tmp[c] = t; nsym[c] = (uint32_t)ns; plen[c] = (uint32_t)sz;
                         st->ctx[c].bytes_b += sz;
                     }
                     vec_put(out, nsym, sizeof nsym);
@@ -396,6 +456,8 @@ int codec_encode(const int16_t *plane, int w, int h, int levels, int cfg,
     }
     st->header_bytes = out->len;
     io_free(&io);
+    free(tab);
+    free(syms);
     return 0;
 }
 
@@ -430,17 +492,21 @@ int codec_decode(const uint8_t *in, size_t inlen, int16_t *plane, int w, int h,
     if (getenv("CDBG"))
         fprintf(stderr, "hdr ok: inlen=%zu nblocks=%u nsb=%d\n", inlen, nblocks, f.nsb);
 
-    rtab_t tab[CODEC_CTX];
-    if (cfg == 1) {
-        for (int c = 0; c < CODEC_CTX; c++) {
-            uint16_t fr[256];
-            uint32_t sum = 0;
-            for (int k = 0; k < 256; k++) {
-                if (rd(in, inlen, &p, &fr[k], 2)) return -1;
-                sum += fr[k];
+    rtab_t (*tab)[CODEC_CTX] = malloc(sizeof(rtab_t) * CODEC_CTX * (size_t)f.nsb);
+    if (!tab) return -1;
+    if (cfg >= 1) {
+        int nsets = (cfg == 2) ? f.nsb : 1;
+        for (int s = 0; s < nsets; s++) {
+            for (int c = 0; c < CODEC_CTX; c++) {
+                uint16_t fr[NSYM];
+                uint32_t sum = 0;
+                for (int k = 0; k < NSYM; k++) {
+                    if (rd(in, inlen, &p, &fr[k], 2)) return -1;
+                    sum += fr[k];
+                }
+                if (sum != RSZ) return -1;
+                rtab_from_freq(&tab[s][c], fr);
             }
-            if (sum != RSZ) return -1;
-            rtab_from_freq(&tab[c], fr);
         }
     }
 
@@ -483,6 +549,7 @@ int codec_decode(const uint8_t *in, size_t inlen, int16_t *plane, int w, int h,
                         io.d[c] = buf[c]; io.nbits[c] = lens[c]; io.pos[c] = 0;
                     }
                 } else {
+                    int ti = (cfg == 2) ? s : 0;
                     uint32_t nsym[CODEC_CTX], lens[CODEC_CTX];
                     if (rd(in, inlen, &p, nsym, sizeof nsym)) return -1;
                     if (rd(in, inlen, &p, lens, sizeof lens)) return -1;
@@ -490,25 +557,29 @@ int codec_decode(const uint8_t *in, size_t inlen, int16_t *plane, int w, int h,
                         fprintf(stderr, "dec1 blk %llu p=%zu nsym=%u,%u,%u,%u plen=%u,%u,%u,%u mb=%d n=%d\n",
                                 (unsigned long long)blk_i, p, nsym[0], nsym[1], nsym[2], nsym[3],
                                 lens[0], lens[1], lens[2], lens[3], mb, n);
-                    size_t need = (size_t)n * 3 + 64;
+                    size_t need = (size_t)n * 5 + 64;
                     if (need > bufcap) {
                         for (int c = 0; c < CODEC_CTX; c++) buf[c] = realloc(buf[c], need);
                         bufcap = need;
                     }
                     for (int c = 0; c < CODEC_CTX; c++) {
-                        if (nsym[c] > need) return -1;
+                        size_t bitbytes = ((size_t)nsym[c] * SYMBITS + 7) / 8;
+                        if (bitbytes > need) return -1;
                         if (p + lens[c] > inlen) return -1;
                         uint8_t *tmp = malloc(lens[c] ? lens[c] : 1);
                         if (lens[c]) memcpy(tmp, in + p, lens[c]);
                         p += lens[c];
-                        if (nsym[c] && rans_dec(tmp, lens[c], &tab[c], buf[c], nsym[c])) {
+                        uint8_t *sb = malloc(nsym[c] ? nsym[c] : 1);
+                        if (nsym[c] && rans_dec(tmp, lens[c], &tab[ti][c], sb, nsym[c])) {
                             if (getenv("CDBG"))
                                 fprintf(stderr, "rans_dec fail ctx=%d nsym=%u plen=%u blk=%llu\n",
                                         c, nsym[c], lens[c], (unsigned long long)blk_i);
-                            free(tmp); return -1;
+                            free(tmp); free(sb); return -1;
                         }
+                        unpack_syms(sb, nsym[c], buf[c]);
+                        free(sb);
                         free(tmp);
-                        io.d[c] = buf[c]; io.nbits[c] = (size_t)nsym[c] * 8; io.pos[c] = 0;
+                        io.d[c] = buf[c]; io.nbits[c] = (size_t)nsym[c] * SYMBITS; io.pos[c] = 0;
                     }
                 }
 
@@ -530,6 +601,7 @@ int codec_decode(const uint8_t *in, size_t inlen, int16_t *plane, int w, int h,
             }
     }
     for (int c = 0; c < CODEC_CTX; c++) free(buf[c]);
+    free(tab);
     (void)st;
     return 0;
 }
