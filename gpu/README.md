@@ -1,5 +1,21 @@
 # GPU wavelet codec
 
+## Provenance
+
+Every coding tool here is traceable to **SMPTE ST 2042-1 (VC-2, first edition 2008)** and the public
+Dirac specification it grew from, both royalty-free: 5/3 integer lifting, slice-independent
+transform restart at a horizontal band boundary, per-(level, orientation) subband handling, and
+magnitude coding with the sign carried separately. The entropy stage is **rANS** — Duda
+(arXiv:1311.2540, Nov 2013) and Giesen's `ryg_rans` (Feb 2014) — which is not a VC-2 tool, and is
+prior art to the 2016-onward JPEG XS patent filings. The warp-cooperative desymboliser is original
+to this codebase.
+
+This matters because JPEG XS has a live FRAND patent pool (Fraunhofer IIS + intoPIX, via Vectis IP),
+whereas VC-2 is royalty-free. The tools this codec shares with JPEG XS at the architectural level
+are the ones disclosed by VC-2 first. What the intoPIX claims add — precincts, GCLI prediction
+modes, per-group gain and quantisation-level machinery — is deliberately **not** implemented here.
+See `../IP_AUDIT.md` §7 before adding any of them.
+
 **MVP: `w5c` is the codec.** Encode a frame to a self-contained bitstream and back, bit-exactly:
 
 ```

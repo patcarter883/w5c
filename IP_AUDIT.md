@@ -248,3 +248,108 @@ traversal. Our grouping of bits into 6-bit symbols is plain bit packing, not an 
 To finish properly: the file histories (continuations, reexaminations, terminal disclaimers) for
 8,934,535 and 11,234,023; the priority dates, since ryg_rans (Feb 2014) is not prior art to
 anything claiming earlier; and counsel's construction of "access profile" and "compressor".
+
+---
+
+## 7. JPEG XS / intoPIX estate, and the VC-2 lineage
+
+This codec is architecturally close to JPEG XS, which makes this the most commercially relevant
+section of the audit. Researched from primary sources: the licensors' own announcements, the
+patent register, and the published standard's implementations.
+
+### 7.1 The two estates
+
+- **JPEG XS has a live patent pool.** Fraunhofer IIS and intoPIX — described in the announcement
+  as "the main JPEG XS standard patent holders" — created a pool administered by Vectis IP
+  (joint licensing programme announced Feb 2021; pool available Mar 2022), licensed on FRAND
+  terms. So JXS-shaped implementations are not free of licensing exposure.
+- **VC-2 is royalty-free.** BBC R&D describe VC-2 as "a royalty-free high-quality video codec",
+  grown out of Dirac, specified in SMPTE ST 2042-1 (first edition 2008, revised 2017), with open
+  reference and optimised implementations published by the BBC, and an IETF RTP payload format
+  (RFC 8450).
+
+That asymmetry is exactly why the lineage argument matters: the same coding tools sourced to VC-2
+(2008, royalty-free) are prior art to intoPIX's filings; sourced to JPEG XS, they are licensed.
+
+### 7.2 Representative intoPIX filings (assignee query, verified)
+
+| Patent | Title | Priority |
+|---|---|---|
+| US 9,332,258 B2 | Method and device for display stream compression | 2013-03-01 |
+| US 10,212,421 B2 | Method and device for digital data compression with sign bit removal | 2016-12-30 |
+| EP 3,556,097 B1 | Image coding using a subband dependent prediction adaption for GCLI entropy encoding | 2016-12-19 |
+| US 11,475,600 B2 | Method and device for digital data compression | 2017-07-10 |
+| EP 4,052,216 B1 | Image processor | 2019-10-30 |
+| EP 4,266,685 A1 | Video encoder comprising a frame buffer assembly | 2022-04-22 |
+
+### 7.3 The two claims that actually overlap
+
+**US 10,212,421 B2 (sign bit removal).** Claim 1 covers compressing coefficients into three
+outputs — a **magnitude** set, a **sign** set and a **metadata** set — by grouping coefficients,
+assigning each group a **gain factor**, computing each group's **Greatest Coded Line Index
+(GCLI)**, and copying magnitude bitplanes and sign bits according to a **quantisation level t**.
+Claim 3 adds "the de-correlative transform is a DWT 5/3 wavelet transform". On architecture, that
+is recognisably the same family as this codec: 5/3 transform, grouped coefficients, magnitude
+bitplanes, sign separable.
+
+Its independent claim nonetheless requires three things this codec does not have: **per-group gain
+factors**, **GCLI index metadata**, and a **quantisation level t** (with the right-shift-by-t that
+implies, and transmission of t). This codec is arithmetic-lossless, has no per-group gain, no GCLI,
+and transmits no quantisation level. **Distinguishing elements: gain, GCLI, t — all absent.**
+
+**EP 3,556,097 B1 (subband-dependent GCLI prediction).** Claim 1 recites a **precinct** spanning
+coefficients from two subbands over a spatial region, computing GCLI per group, and encoding the
+GCLI of one subband in a first mode and the other in a second, the modes being **vertical
+prediction, horizontal prediction or raw**. This codec has no precinct, no GCLI, and no
+prediction-mode selection — its per-subband variation is a *measured rANS probability table*, not a
+predicted GCLI. **No counterpart to any element of the claim's distinguishing structure.**
+
+### 7.4 VC-2 lineage — every shared tool traced to the standard
+
+| Element in this codec | VC-2 / Dirac disclosure | Where verified |
+|---|---|---|
+| 5/3 reversible integer lifting | VC-2 defines the 5/3 filter with a configurable wavelet depth | ST 2042-1:2008; Dirac spec; `vc2enc.c` `wavelet_depth`, `wavelet_idx` |
+| Analysis into per-(level, orientation) subbands | Subband split per level and orientation, coded per subband | BBC `split_into_subbands()`; `vc2enc.c` loop over `level`, `orientation` with `quant[level][orientation]` |
+| **Slicing: horizontal strip, independently coded, transform restarted at the boundary** | VC-2 slices are horizontal strips with per-slice byte allocation and independent decodability | BBC `Slices.cpp` — `slice_bytes()`, `component_slice_bytes()`, `slice_prefix`, `suggestSliceSize()`; `vc2enc.c` `encode_slice_params()` |
+| **Magnitude coded, sign carried separately, sign only when magnitude non-zero** | VC-2 codes an unsigned exp-Golomb magnitude and then, if non-zero, a single sign bit | `vc2enc.c` `encode_subband()`: `put_vc2_ue_uint_inline(pb, c_abs); if (c_abs) put_bits(pb, 1, coeff[x] < 0);` |
+| Group/code-block independent parallel coding | Slices are independently decodable units, enabling parallel and low-latency operation | ST 2042-1 slice structure; `suggestSliceSize()` |
+| Per-band parameterisation of the coder | Per-(level, orientation) quantisation parameters | `quant[level][orientation]`; `encode_quant_matrix()` |
+
+On this evidence the **architecture is claimable from VC-2**: 5/3 lifting, slice-independent
+transform restart, per-subband handling, and magnitude-with-separate-sign coding are all disclosed
+in a royalty-free published standard five to eight years before the intoPIX filings above. The
+separate *sign stream* is further anticipated by sign coding as a distinct element in EZW (Shapiro,
+1993) and EBCOT/JPEG 2000 (2000).
+
+Version caveat: the prior-art date relied on is the **2008 first edition** of ST 2042-1 and the
+public Dirac specification before it. Everything in the table above is Dirac-core functionality
+present from the outset, not a tool added in the 2017 revision — but if any element were ever
+traced to a post-2016 addition, it would stop being prior art to the 2016 filings and the argument
+would have to be re-based.
+
+### 7.5 What is genuinely NOT traceable to VC-2
+
+Three things, stated plainly rather than folded into the lineage claim:
+
+1. **rANS.** VC-2 uses exp-Golomb VLC coding, not rANS. Ours comes from Duda (arXiv:1311.2540,
+   Nov 2013) and ryg_rans (Giesen, Feb 2014). This postdates VC-2 by five years — but it
+   **predates all four intoPIX filings that matter** (2016-12, 2017-07, 2019-10), so it is prior
+   art against them rather than a gap in our position. It will not help against the 2013-03 filing
+   (US 9,332,258, display stream compression), though that patent's subject is display stream
+   compression rather than wavelet entropy coding.
+2. **Per-context measured, transmitted probability tables.** VC-2 parameterises per subband but
+   does not transmit per-context entropy models. Closest prior art is EBCOT's per-subband context
+   modelling (2000) and CABAC's context modelling (2003); no exact match identified.
+3. **Warp-cooperative desymbolisation** (mask-derived bit positions, one warp per code-block). No
+   VC-2 counterpart and no patent found; it appears to be original engineering here.
+
+### 7.6 Practical consequence
+
+- Keep the lineage written down — this file is the record — and cite VC-2/Dirac, Duda and ryg_rans
+  in the README rather than describing the design in JPEG XS vocabulary.
+- **Do not adopt the JXS-specific tools when chasing further rate gains.** Precincts, GCLI
+  prediction modes, and per-group gain/quantisation-level machinery are precisely the elements the
+  intoPIX claims recite, and precisely the elements this codec currently does not have. The
+  section 7.3 analysis is only clean because they are absent.
+- Further rate work should therefore stay on the safe side of that line: better probability
+  modelling and context selection, not JXS's coefficient-length machinery.
