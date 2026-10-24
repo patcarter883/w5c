@@ -115,7 +115,9 @@ int main(int argc, char **argv)
     printf("device: %s (%s), multiProcessorCount=%d, maxThreads/CU=%d\n",
            prop.name, prop.gcnArchName, prop.multiProcessorCount, prop.maxThreadsPerMultiProcessor);
 
-    HIPCHECK(hipMemcpyToSymbol(c_tab, tabs.data(), tabs.size() * sizeof(gtab_t)));
+    gtab_t *d_gtab;
+    HIPCHECK(hipMalloc(&d_gtab, tabs.size() * sizeof(gtab_t)));
+    HIPCHECK(hipMemcpy(d_gtab, tabs.data(), tabs.size() * sizeof(gtab_t), hipMemcpyHostToDevice));
 
     uint8_t *d_sym, *d_out; uint32_t *d_soff, *d_slen, *d_olen, *d_cap, *d_ooff; uint16_t *d_stab;
     HIPCHECK(hipMalloc(&d_sym, total_syms));
@@ -138,7 +140,7 @@ int main(int argc, char **argv)
     std::vector<uint32_t> olen(ns);
     {
         int bs = 128, nb = (ns + bs - 1) / bs;
-        k_enc<<<nb, bs>>>(d_sym, d_soff, d_slen, d_stab, d_cap, d_ooff, d_out, d_olen, ns);
+        k_enc<<<nb, bs>>>(d_gtab, d_sym, d_soff, d_slen, d_stab, d_cap, d_ooff, d_out, d_olen, ns);
         HIPCHECK(hipGetLastError());
         HIPCHECK(hipDeviceSynchronize());
         HIPCHECK(hipMemcpy(outc.data(), d_out, out_bytes, hipMemcpyDeviceToHost));
@@ -157,7 +159,7 @@ int main(int argc, char **argv)
     {
         int bs = 128, nb = (ns + bs - 1) / bs;
         std::fill(outc.begin(), outc.end(), 0);
-        k_enc_rcp<<<nb, bs>>>(d_sym, d_soff, d_slen, d_stab, d_cap, d_ooff, d_out, d_olen, ns);
+        k_enc_rcp<<<nb, bs>>>(d_gtab, d_sym, d_soff, d_slen, d_stab, d_cap, d_ooff, d_out, d_olen, ns);
         HIPCHECK(hipGetLastError());
         HIPCHECK(hipDeviceSynchronize());
         HIPCHECK(hipMemcpy(outc.data(), d_out, out_bytes, hipMemcpyDeviceToHost));
@@ -233,20 +235,20 @@ int main(int argc, char **argv)
 
         const int iters = 20;
         for (int w = 0; w < 5; w++)
-            k_enc<<<nb, bs>>>(D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
+            k_enc<<<nb, bs>>>(d_gtab, D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
         HIPCHECK(hipDeviceSynchronize());
         double t0 = now_s();
         for (int it = 0; it < iters; it++)
-            k_enc<<<nb, bs>>>(D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
+            k_enc<<<nb, bs>>>(d_gtab, D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
         HIPCHECK(hipDeviceSynchronize());
         double dt = (now_s() - t0) / iters;
 
         for (int w = 0; w < 5; w++)
-            k_enc_rcp<<<nb, bs>>>(D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
+            k_enc_rcp<<<nb, bs>>>(d_gtab, D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
         HIPCHECK(hipDeviceSynchronize());
         double t1 = now_s();
         for (int it = 0; it < iters; it++)
-            k_enc_rcp<<<nb, bs>>>(D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
+            k_enc_rcp<<<nb, bs>>>(d_gtab, D_sym, D_so, D_sl, D_st, D_ca, D_oo, D_out, D_ol, (int)n2);
         HIPCHECK(hipDeviceSynchronize());
         double dt2 = (now_s() - t1) / iters;
 

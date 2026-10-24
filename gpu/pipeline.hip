@@ -152,6 +152,10 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
 
     std::vector<uint32_t> gnb(ns_total), soff(ns_total + 1), nsym(ns_total);
     HIPCHECK(hipMemcpy(gnb.data(), d_nb, ns_total * 4, hipMemcpyDeviceToHost));
+    if (getenv("W5C_DIAG")) {
+        uint64_t tb = 0; for (int i = 0; i < ns_total; i++) tb += gnb[i];
+        printf("    [diag] streams=%d tables=%d total_bits=%llu\n", ns_total, ntab, (unsigned long long)tb);
+    }
     { uint64_t acc = 0;
       for (int i = 0; i < ns_total; i++) {
           nsym[i] = (gnb[i] + SYMBITS - 1) / SYMBITS;
@@ -193,9 +197,15 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
 
     std::vector<uint16_t> freqs((size_t)ntab * NSYM);
     HIPCHECK(hipMemcpy(freqs.data(), d_freq, freqs.size() * 2, hipMemcpyDeviceToHost));
+    if (getenv("W5C_DIAG")) {
+        uint64_t fs = 0; for (size_t i = 0; i < freqs.size(); i++) fs += (uint64_t)freqs[i] * (i % 97 + 1);
+        printf("    [diag] freq_checksum=%llu\n", (unsigned long long)fs);
+    }
     std::vector<gtab_t> gtabs;
     build_gtabs(gtabs, freqs, ntab);
-    HIPCHECK(hipMemcpyToSymbol(c_tab, gtabs.data(), gtabs.size() * sizeof(gtab_t)));
+    gtab_t *d_gtab;
+    HIPCHECK(hipMalloc(&d_gtab, gtabs.size() * sizeof(gtab_t)));
+    HIPCHECK(hipMemcpy(d_gtab, gtabs.data(), gtabs.size() * sizeof(gtab_t), hipMemcpyHostToDevice));
 
     /* per-stream capacity for the encoder output, then a tight copy into the container */
     std::vector<uint32_t> cap(ns_total), ooff(ns_total + 1);
@@ -211,7 +221,7 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     HIPCHECK(hipMemcpy(d_ooff, ooff.data(), ns_total * 4, hipMemcpyHostToDevice));
 
     HIPCHECK(hipEventRecord(e0));
-    k_enc<<<nbs, 128>>>(d_sym, d_so, d_nso, d_stab, d_cap, d_ooff, d_out, d_olen, ns_total);
+    k_enc<<<nbs, 128>>>(d_gtab, d_sym, d_so, d_nso, d_stab, d_cap, d_ooff, d_out, d_olen, ns_total);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());
@@ -222,8 +232,19 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     HIPCHECK(hipMemcpy(olen.data(), d_olen, ns_total * 4, hipMemcpyDeviceToHost));
     HIPCHECK(hipMemcpy(encbuf.data(), d_out, ooff[ns_total], hipMemcpyDeviceToHost));
 
+    if (getenv("W5C_BITS")) {
+        static const char *nm[4] = { "siggrp", "sig", "sign", "refine" };
+        uint64_t by[4] = {0,0,0,0}, sy[4] = {0,0,0,0};
+        uint64_t tot = 0;
+        for (int i = 0; i < ns_total; i++) { by[desc[i].ctx] += olen[i]; sy[desc[i].ctx] += nsym[i]; tot += olen[i]; }
+        for (int c = 0; c < 4; c++)
+            printf("    [bits] %-7s %8.1f KB  %5.1f%%  %9.2f M sym  %.2f bit/sym\n",
+                   nm[c], by[c] / 1024.0, tot ? 100.0 * by[c] / tot : 0.0,
+                   sy[c] / 1e6, sy[c] ? 8.0 * by[c] / sy[c] / SYMBITS : 0.0);
+    }
+
     size_t hdr = 32 + (size_t)np * 8 + (size_t)ntab * NSYM * 2
-               + (size_t)nb_total * 4 + (size_t)ns_total * 8;
+               + (size_t)nb_total + (size_t)ns_total * 2;
     size_t payload = 0;
     for (int i = 0; i < ns_total; i++) payload += olen[i];
     out.clear();
@@ -235,18 +256,47 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     put32((uint32_t)blk); put32(0);
     for (int i = 0; i < np; i++) { put32((uint32_t)P[i].w); put32((uint32_t)P[i].h); }
     out.insert(out.end(), (uint8_t *)freqs.data(), (uint8_t *)freqs.data() + freqs.size() * 2);
-    for (int i = 0; i < nb_total; i++) put32((uint32_t)bds[i].mb);
-    for (int i = 0; i < ns_total; i++) { put32(nsym[i]); put32(olen[i]); }
+    for (int i = 0; i < nb_total; i++) out.push_back((uint8_t)bds[i].mb);
+    /* Lengths as varints: at fixed 4+4 bytes they were 5.5% of the file at blk=32 and 35% at
+       blk=8, because every halving of the block size quadruples the stream count. */
+    auto putv = [&](uint32_t v) {
+        while (v >= 0x80) { out.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+        out.push_back((uint8_t)v);
+    };
+    for (int i = 0; i < ns_total; i++) { putv(nsym[i]); putv(olen[i]); }
     for (int i = 0; i < ns_total; i++)
         out.insert(out.end(), encbuf.data() + ooff[i], encbuf.data() + ooff[i] + olen[i]);
 
     (void)hipFree(d_bd); (void)hipFree(d_nw); (void)hipFree(d_desc); (void)hipFree(d_bits); (void)hipFree(d_boff); (void)hipFree(d_nb);
     (void)hipFree(d_sym); (void)hipFree(d_so); (void)hipFree(d_nso); (void)hipFree(d_stab);
     (void)hipFree(d_hist); (void)hipFree(d_pool); (void)hipFree(d_freq);
+    (void)hipFree(d_gtab);
     (void)hipFree(d_out); (void)hipFree(d_cap); (void)hipFree(d_ooff); (void)hipFree(d_olen);
     (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
 
     if (sm) { *sm = z; sm->sym = ms_sym; sm->pack = ms_pack; sm->hist = ms_hist; sm->enc = ms_enc; }
+    return true;
+}
+
+/* Offset and length of the payload region. Single source of truth for the container layout, so
+   a harness cannot drift out of sync with the writer when the header changes. */
+static bool w5c_payload_span(const uint8_t *in, size_t inlen, size_t *off, size_t *plen)
+{
+    if (inlen < 32) return false;
+    const uint32_t *h = (const uint32_t *)in;
+    if (h[0] != W5C_MAGIC) return false;
+    int np = (int)h[1], nb_total = (int)h[3], ns_total = (int)h[4], ntab = (int)h[5];
+    size_t p = 32 + (size_t)np * 8 + (size_t)ntab * NSYM * 2 + (size_t)nb_total;
+    for (int i = 0; i < ns_total * 2; i++) {
+        int sh = 0;
+        for (;;) {
+            if (p >= inlen || sh > 28) return false;
+            uint8_t c = in[p++];
+            if (!(c & 0x80)) break;
+            sh += 7;
+        }
+    }
+    *off = p; *plen = inlen - p;
     return true;
 }
 
@@ -276,7 +326,7 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     if (hnp != np || np < 1 || np > W5C_MAXPLANES) return false;
 
     size_t p = 32 + (size_t)np * 8;
-    if (inlen < p + (size_t)ntab * NSYM * 2 + (size_t)nb_total * 4 + (size_t)ns_total * 8) return false;
+    if (inlen < p + (size_t)ntab * NSYM * 2 + (size_t)nb_total) return false;
 
     std::vector<uint16_t> freqs((size_t)ntab * NSYM);
     memcpy(freqs.data(), in + p, freqs.size() * 2); p += freqs.size() * 2;
@@ -294,13 +344,23 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     std::vector<bdesc> bds;
     bds.reserve(nb_total);
     for (int i = 0; i < np; i++) bds.insert(bds.end(), g[i].bd, g[i].bd + g[i].nblocks);
-    for (int b = 0; b < nb_total; b++) { bds[b].mb = (int)*(const uint32_t *)(in + p); p += 4; }
+    for (int b = 0; b < nb_total; b++) { bds[b].mb = (int)in[p]; p += 1; }
 
     std::vector<uint32_t> nsym(ns_total), plen(ns_total), soff(ns_total + 1), eoff(ns_total + 1);
     uint64_t sacc = 0, eacc = 0;
+    auto getv = [&](uint32_t &v) -> bool {
+        uint32_t r = 0; int sh = 0;
+        for (;;) {
+            if (p >= inlen || sh > 28) return false;
+            uint8_t c = in[p++];
+            r |= (uint32_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) break;
+            sh += 7;
+        }
+        v = r; return true;
+    };
     for (int i = 0; i < ns_total; i++) {
-        nsym[i] = *(const uint32_t *)(in + p); p += 4;
-        plen[i] = *(const uint32_t *)(in + p); p += 4;
+        if (!getv(nsym[i]) || !getv(plen[i])) return false;
         soff[i] = (uint32_t)sacc; sacc += nsym[i];
         eoff[i] = (uint32_t)eacc; eacc += plen[i];
     }
@@ -403,34 +463,61 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
 
 /* Forward / inverse transform for a whole set of planes.
 
-   Each level is two dependent launches, so one plane's chain is 10 launches that cannot overlap
-   with themselves: the transform measured 0.31 ms of GPU work but 1.95 ms of wall time. Planes
-   are independent of each other, so they go on separate streams and fill each other's gaps. */
+   Two coalesced passes per axis per level, ping-ponging between the plane and a cached scratch
+   buffer because the packed subband layout overwrites the source positions.
+
+   Everything runs on the default stream. Per-plane streams were tried and measured as no help
+   (dispatch is ~0.7 us and the transform is memory-bound); they were also a correctness hazard,
+   because a non-blocking stream does not wait for the default stream that just uploaded the
+   samples, so the first call after an upload could transform a half-written plane. */
+static void split_launch(bool fwd, hipStream_t st, const int16_t *src, int16_t *dst,
+                         long line_pitch, long stride, int nlines, int n, int posmajor)
+{
+    int nev = (n + 1) / 2;
+    /* position-major enumerates (line, position) so it needs all n positions per line, and the
+       upper half simply falls through; line-major enumerates (position, line) and needs only the
+       nev useful positions */
+    long threads = posmajor ? (long)nlines * n : (long)nlines * nev;
+    if (threads <= 0) return;
+    int grid = (int)((threads + 255) / 256);
+    if (fwd) k_dwt_fwd_split<<<grid, 256, 0, st>>>(src, dst, line_pitch, stride, nlines, n, posmajor);
+    else     k_dwt_inv_split<<<grid, 256, 0, st>>>(src, dst, line_pitch, stride, nlines, n, posmajor);
+}
+
 static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms)
 {
-    static hipStream_t st[W5C_MAXPLANES];
+    static int16_t *scr[W5C_MAXPLANES];
+    static size_t scrn[W5C_MAXPLANES];
     static bool init = false;
     if (!init) {
-        for (int i = 0; i < W5C_MAXPLANES; i++) HIPCHECK(hipStreamCreate(&st[i]));
+        for (int i = 0; i < W5C_MAXPLANES; i++) { scr[i] = nullptr; scrn[i] = 0; }
         init = true;
     }
 
     auto t0 = std::chrono::steady_clock::now();
     for (int k = 0; k < np; k++) {
+        size_t need = (size_t)P[k].w * P[k].h * 2;
+        if (scrn[k] < need) {
+            if (scr[k]) (void)hipFree(scr[k]);
+            HIPCHECK(hipMalloc(&scr[k], need));
+            scrn[k] = need;
+        }
         int cw[16], ch[16];
         int nl = level_sizes(P[k].w, P[k].h, levels, cw, ch);
         for (int L = 0; L < nl; L++) {
             int i = fwd ? L : nl - 1 - L;
             if (fwd) {
-                k_lift1d_fwd<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2, st[k]>>>(P[k].d, 0, (long)P[k].w, 1, cw[i]);
-                k_lift1d_fwd<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2, st[k]>>>(P[k].d, 0, 1, (long)P[k].w, ch[i]);
+                /* rows into scratch, then columns back into the plane */
+                split_launch(true, 0, P[k].d, scr[k], (long)P[k].w, 1, ch[i], cw[i], 1);
+                split_launch(true, 0, scr[k], P[k].d, 1, (long)P[k].w, cw[i], ch[i], 0);
             } else {
-                k_lift1d_inv<<<cw[i], LIFT_BS, (size_t)2 * ch[i] * 2, st[k]>>>(P[k].d, 0, 1, (long)P[k].w, ch[i]);
-                k_lift1d_inv<<<ch[i], LIFT_BS, (size_t)2 * cw[i] * 2, st[k]>>>(P[k].d, 0, (long)P[k].w, 1, cw[i]);
+                /* inverse undoes columns first, then rows */
+                split_launch(false, 0, P[k].d, scr[k], 1, (long)P[k].w, cw[i], ch[i], 0);
+                split_launch(false, 0, scr[k], P[k].d, (long)P[k].w, 1, ch[i], cw[i], 1);
             }
         }
     }
-    for (int k = 0; k < np; k++) HIPCHECK(hipStreamSynchronize(st[k]));
+    HIPCHECK(hipDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
     if (ms) *ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
 }

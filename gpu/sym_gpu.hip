@@ -14,6 +14,7 @@
    Build: see Makefile.   Run: ./sym_gpu [w] [h] [levels] [(0..2|rawfile)]
 */
 #include "kernels.hi"
+#include "pipeline.hip"
 extern "C" {
 #include "codec.h"
 #include "wavelet.h"
@@ -56,15 +57,11 @@ int main(int argc, char **argv)
 
     /* coefficients via the GPU transform (same path the driver uses) */
     {
-        int cw[16], ch[16];
-        int nl = level_sizes(w, h, levels, cw, ch);
         int16_t *d = nullptr;
         HIPCHECK(hipMalloc(&d, npx * 2));
         HIPCHECK(hipMemcpy(d, img.data(), npx * 2, hipMemcpyHostToDevice));
-        for (int L = 0; L < nl; L++) {
-            k_lift1d_fwd<<<ch[L], 256, (size_t)2 * cw[L] * 2>>>(d, 0, (long)w, 1, cw[L]);
-            k_lift1d_fwd<<<cw[L], 256, (size_t)2 * ch[L] * 2>>>(d, 0, 1, (long)w, ch[L]);
-        }
+        plane_t PT[1] = {{d, w, h}};
+        plane_dwt_all(PT, 1, levels, true, nullptr);
         HIPCHECK(hipGetLastError());
         HIPCHECK(hipMemcpy(coef.data(), d, npx * 2, hipMemcpyDeviceToHost));
         hipFree(d);

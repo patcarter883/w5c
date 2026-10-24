@@ -13,16 +13,16 @@ rans_gpu: rans_gpu.hip kernels.hi
 rans_dec: rans_dec.hip kernels.hi
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -o $@ $<
 
-dwt_gpu.o: dwt_gpu.hip kernels.hi $(REF)/wavelet.h
+dwt_gpu.o: dwt_gpu.hip pipeline.hip kernels.hi $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
 
-sym_gpu.o: sym_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
+sym_gpu.o: sym_gpu.hip pipeline.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
 
 sym_gpu: sym_gpu.o codec_ref.o wavelet_ref.o
 	$(HIP) -o $@ $^
 
-codec_gpu.o: codec_gpu.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
+codec_gpu.o: codec_gpu.hip pipeline.hip kernels.hi $(REF)/codec.h $(REF)/wavelet.h
 	$(HIP) -O3 -std=c++17 --offload-arch=$(ARCH) -I$(REF) -c -o $@ $<
 
 # the CPU reference is linked in as the spec, not reimplemented

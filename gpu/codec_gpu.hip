@@ -98,11 +98,8 @@ int main(int argc, char **argv)
     if (!gpu_encode_frame(P1, 1, levels, 64, bits, &sf)) { printf("GPU encode failed\n"); return 1; }
 
     {
-        const uint32_t *h32 = (const uint32_t *)bits.data();
-        int ntab = (int)h32[5], nblocks = (int)h32[3], ns = (int)h32[4], npl = (int)h32[1];
-        size_t off = 32 + (size_t)npl * 8 + (size_t)ntab * NSYM * 2
-                   + (size_t)nblocks * 4 + (size_t)ns * 8;
-        size_t plen = bits.size() - off;
+        size_t off = 0, plen = 0;
+        if (!w5c_payload_span(bits.data(), bits.size(), &off, &plen)) { printf("bad container\n"); return 1; }
         int same = (plen == refbits.size()) && !memcmp(bits.data() + off, refbits.data(), plen);
         printf("2. GPU encode          %7.2f ms   %s (%zu B)\n",
                sf.sym + sf.pack + sf.hist + sf.enc,

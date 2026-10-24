@@ -10,14 +10,19 @@ make
 ./w5c dec    <in.w5c> <out.raw>
 
 ./w5c enc422 /tmp/one422.yuv /tmp/f.w5c 1920 1080 5
-  -> 2,925,902 B, 5.644 bpp, 8,294,400 -> 2,925,902 bytes   (blk=32, lossless)
-  -> fwd 1.99 ms  sym 4.10  pack 0.79  hist 0.95  enc 0.52  = 8.43 ms
+  -> 2,830,519 B, 5.460 bpp, 8,294,400 -> 2,830,519 bytes   (blk=32, lossless)
+  -> fwd 0.4 ms  sym 4.0  pack 0.8  hist 0.5  enc 0.5      = 6.2 ms
 ./w5c dec422 /tmp/f.w5c /tmp/f_out.yuv
-  -> rANS 2.09 ms  desym 2.64 ms  inv 0.50 ms              = 5.17 ms
+  -> rANS 0.6 ms  desym 2.5 ms  inv 0.35 ms                = 3.4 ms
 ```
 
 `cmp` on the input and output: **bit-exact**. All planes of a frame travel in one container and
 are encoded in one kernel launch per stage. No rate control (lossless only), no muxing.
+
+**Measure per frame, not per process.** A fresh process pays ~1.4 ms on the first launch of each
+kernel type, which dwarfs real stage costs at these speeds. `W5C_REPEAT=n` repeats the whole
+encode or decode in-process and reports the best iteration; every number in this file is steady
+state from that. Single-run figures are 15-25% pessimistic.
 
 `W5C_BLK` sets the code-block size (8/16/32/64, default **32**). It is the speed/rate knob, and
 it is the single most important parameter in the codec — see the trade curve below.
@@ -43,19 +48,18 @@ Two changes followed, worth 8-10x between them:
 
    | blk | bytes/frame | bpp | encode ms | decode ms |
    |---|---|---|---|---|
-   | 64 | 2,767,007 | 5.338 | 30.05 | 34.45 |
-   | **32** | **2,925,902** | **5.644** | **8.50** | **5.20** |
-   | 16 | 3,555,279 | 6.858 | 7.19 | 4.72 |
-   | 8 | 6,048,398 | 11.667 | 4.80 | 5.96 |
+   | 64 | 2,742,514 | 5.290 | 30.0 | 34.4 |
+   | **32** | **2,830,519** | **5.460** | **6.2** | **3.4** |
+   | 16 | 3,122,032 | 6.022 | 7.2 | 4.7 |
+   | 8 | 4,282,139 | 8.260 | 4.8 | 5.9 |
 
    All rows bit-exact. 32 is the default: 3x the speed of 64 for 6% rate.
 
-   **Where the rate cost of small blocks actually goes:** 31% of it, at every step, is rANS
-   flush overhead — 4 bytes of final state per stream, and every halving of block size
-   quadruples the stream count. At blk=32 the frame carries 16,964 streams and 68 KB of flush
-   (2.3% of the file); at blk=8 it carries 261,668 streams and 1.02 MB of flush. So the
-   parallelism in the table is *bought with stream count*, not just with modelling. Any future
-   scheme that gets more work-items **without** adding streams would scale for nearly free.
+   **Where the rate cost of small blocks goes, measured:** 31% of it is rANS flush (4 bytes of
+   final state per stream, and every halving of block size quadruples the stream count) and most
+   of the rest was per-stream header. Encoding lengths as varints and the per-block bitplane
+   count as one byte instead of two u32s cut the frame by 3.3% at blk=32, 12% at blk=16 and 29%
+   at blk=8 — the fast settings were mostly paying container tax, not coding cost.
 
 2. **All planes in one launch.** A 1080p chroma plane has a quarter of the code-blocks of luma
    and on its own left the machine idle — it cost 9.3 ms for a quarter of the pixels. Batched

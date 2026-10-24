@@ -91,15 +91,37 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     }
 
     float ms_fwd = 0;
-    plane_dwt_all(P, np, levels, true, &ms_fwd);
+
+    /* W5C_REPEAT repeats the whole encode in-process. A single run pays ~2 ms of cold start
+       (first kernel of each type), which is meaningless for a codec that runs per frame. */
+    int rep = 1;
+    if (const char *e = getenv("W5C_REPEAT")) { rep = atoi(e); if (rep < 1) rep = 1; }
 
     std::vector<uint8_t> bits;
-    stage_ms sm;
-    if (!gpu_encode_frame(P, np, levels, blk, bits, &sm)) { fprintf(stderr, "encode failed\n"); return 1; }
-    if (!write_file(outp, bits.data(), bits.size())) return 1;
+    stage_ms sm, best_sm = {};
+    double best = 0;
+    for (int r = 0; r < rep; r++) {
+        float t = 0;
+        /* the transform is in place, so each repeat starts from the pristine samples */
+        if (r) for (int i = 0; i < np; i++)
+            HIPCHECK(hipMemcpy(P[i].d, img[i].data(), (size_t)P[i].w * P[i].h * 2, hipMemcpyHostToDevice));
+        plane_dwt_all(P, np, levels, true, &t);
+        if (getenv("W5C_DIAG")) {
+            std::vector<int16_t> chk((size_t)P[0].w * P[0].h);
+            HIPCHECK(hipMemcpy(chk.data(), P[0].d, chk.size() * 2, hipMemcpyDeviceToHost));
+            long long s1 = 0, s2 = 0; long nz = 0;
+            for (size_t i = 0; i < chk.size(); i++) { s1 += chk[i]; s2 += llabs((long long)chk[i]); if (chk[i]) nz++; }
+            printf("    [diag] iter %d coef sum=%lld abs=%lld nz=%ld\n", r, s1, s2, nz);
+        }
+        if (!gpu_encode_frame(P, np, levels, blk, bits, &sm)) { fprintf(stderr, "encode failed\n"); return 1; }
+        if (!write_file(outp, bits.data(), bits.size())) return 1;
+        double tot = t + sm.sym + sm.pack + sm.hist + sm.enc;
+        if (r == 0 || tot < best) { best = tot; best_sm = sm; ms_fwd = t; }
+    }
+    sm = best_sm;
 
     double px = (double)w * h * (yuv422 ? 2.0 : 1.0);   /* 4:2:2 = 2 samples per pixel */
-    double tot = ms_fwd + sm.sym + sm.pack + sm.hist + sm.enc;
+    double tot = rep > 1 ? best : ms_fwd + sm.sym + sm.pack + sm.hist + sm.enc;
     printf("%s: %dx%d%s levels=%d blk=%d  %zu B  %.3f bpp  %zu -> %zu bytes\n",
            inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, bits.size(),
            (double)bits.size() * 8.0 / px, raw.size(), bits.size());
@@ -129,11 +151,20 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
         HIPCHECK(hipMalloc(&P[i].d, npx * 2));
     }
 
-    stage_ms sm;
-    if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
+    int rep = 1;
+    if (const char *e = getenv("W5C_REPEAT")) { rep = atoi(e); if (rep < 1) rep = 1; }
 
-    float ms_inv = 0;
-    plane_dwt_all(P, np, levels, false, &ms_inv);
+    stage_ms sm, best_sm = {};
+    float ms_inv = 0, best_inv = 0;
+    double best = 0;
+    for (int r = 0; r < rep; r++) {
+        float t = 0;
+        if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
+        plane_dwt_all(P, np, levels, false, &t);
+        double tot = sm.dec + sm.desym + t;
+        if (r == 0 || tot < best) { best = tot; best_sm = sm; best_inv = t; }
+    }
+    sm = best_sm; ms_inv = best_inv;
 
     std::vector<int16_t> out[W5C_MAXPLANES];
     int mx = 0;
@@ -161,7 +192,7 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     }
 
     double px = (double)P[0].w * P[0].h * (yuv422 ? 2.0 : 1.0);
-    double tot = sm.dec + sm.desym + ms_inv;
+    double tot = rep > 1 ? best : sm.dec + sm.desym + ms_inv;
     printf("%s: %d plane(s) %dx%d blk=%d  %zu B -> decoded  rANS %.2f ms  desym %.2f ms  inv %.2f ms\n",
            inp, np, P[0].w, P[0].h, blk, bits.size(), sm.dec, sm.desym, ms_inv);
     printf("RESULT bytes=%zu dec=%.3f px=%zu\n", bits.size(), tot, (size_t)px);

@@ -36,7 +36,9 @@ struct dtab_t {                 /* decoder: adds the 4 KB slot lookup */
     uint8_t  slot[RSZ];
 };
 
-__constant__ gtab_t c_tab[MAXTAB];
+/* Tables live in a device buffer rather than __constant__: a hipMemcpyToSymbol issued
+   before any kernel that uses the symbol has been registered can be silently dropped, which
+   made the very first encode in a process use garbage tables. */
 
 /* --------------------------------------------------------------- transform */
 __device__ __forceinline__ int mir(int i, int n)
@@ -50,64 +52,90 @@ __device__ __forceinline__ int mir(int i, int n)
 
 /* One work-group per line. Two parallel phases split by a barrier: predict reads only
    input samples, update reads only predicted details. */
-__global__ void k_lift1d_fwd(int16_t * __restrict__ buf, long off, long line_pitch,
-                             long stride, int n)
-{
-    extern __shared__ int16_t sh[];
-    int line = blockIdx.x;
-    int16_t *p = buf + off + (long)line * line_pitch;
-    int16_t *src = sh, *dst = sh + n;
-    int nev = (n + 1) / 2, nod = n / 2;
+/* Phase-split 5/3 lifting, one thread per output sample.
 
-    for (int i = threadIdx.x; i < n; i += blockDim.x) src[i] = p[(long)i * stride];
-    __syncthreads();
-    if (n <= 1) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = src[i];
-        return;
-    }
-    for (int i = threadIdx.x; i < nod; i += blockDim.x) {
-        int a = src[2 * mir(i, nev)], b = src[2 * mir(i + 1, nev)];
-        dst[nev + i] = (int16_t)(src[2 * i + 1] - ((a + b) >> 1));
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < nev; i += blockDim.x) {
-        int dm = dst[nev + mir(i - 1, nod)], dp = dst[nev + mir(i, nod)];
-        dst[i] = (int16_t)(src[2 * i] + ((dm + dp + 2) >> 2));
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = dst[i];
+   The old form staged a whole line in LDS and lifted it there, which forced one work-group per
+   line: for the column pass that means reading with stride = row pitch, so every sample drags a
+   whole cache line - about 265 MB of line traffic per pass at 1080p, and it dominated the
+   transform. Splitting the lifting into its predict and update phases removes the need for LDS
+   staging entirely, so both the read of the source and the write of the result can be laid out
+   coalesced: threads are mapped so that adjacent threads touch adjacent addresses on whichever
+   axis is being transformed.
+
+   The cost is that the packed output (lowpass at 0..nev-1, details at nev..n-1) overlaps the
+   input, so the caller ping-pongs between the plane and a scratch buffer. Detail values needed
+   by the update phase are recomputed from the source rather than read back, which keeps each
+   axis to a single pass.
+
+   Both axes use the same kernels:
+     rows:    line_pitch = w, stride = 1, nlines = h, n = w, posmajor = 1
+     columns: line_pitch = 1, stride = w, nlines = w, n = h, posmajor = 0
+*/
+/* The reference writes each detail into the int16 line and reads it back, so a value that
+   overflows int16 is truncated at that point. Recomputing it must truncate identically, or the
+   update phase sees a different number than the stored one. */
+__device__ __forceinline__ int det_at(const int16_t *s, long stride, int j, int nev)
+{
+    int a = s[(long)2 * mir(j, nev) * stride];
+    int b = s[(long)2 * mir(j + 1, nev) * stride];
+    return (int16_t)(s[(long)(2 * j + 1) * stride] - ((a + b) >> 1));
 }
 
-__global__ void k_lift1d_inv(int16_t * __restrict__ buf, long off, long line_pitch,
-                             long stride, int n)
+__device__ __forceinline__ int ev_at(const int16_t *s, long stride, int j, int nev, int nod)
 {
-    extern __shared__ int16_t sh[];
-    int line = blockIdx.x;
-    int16_t *p = buf + off + (long)line * line_pitch;
-    int16_t *src = sh, *dst = sh + n;
-    int nev = (n + 1) / 2, nod = n / 2;
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) src[i] = p[(long)i * stride];
-    __syncthreads();
-    if (n <= 1) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = src[i];
-        return;
-    }
-    for (int i = threadIdx.x; i < nev; i += blockDim.x) {
-        int dm = src[nev + mir(i - 1, nod)], dp = src[nev + mir(i, nod)];
-        dst[2 * i] = (int16_t)(src[i] - ((dm + dp + 2) >> 2));
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < nod; i += blockDim.x) {
-        int a = dst[2 * mir(i, nev)], b = dst[2 * mir(i + 1, nev)];
-        dst[2 * i + 1] = (int16_t)(src[nev + i] + ((a + b) >> 1));
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) p[(long)i * stride] = dst[i];
+    int dm = s[(long)(nev + mir(j - 1, nod)) * stride];
+    int dp = s[(long)(nev + mir(j, nod)) * stride];
+    return (int16_t)(s[(long)j * stride] - ((dm + dp + 2) >> 2));
 }
 
-/* ---------------------------------------------------------------- rANS enc */
-__global__ void k_enc(const uint8_t * __restrict__ sym,
+__global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
+                                long line_pitch, long stride, int nlines, int n, int posmajor)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int line, k;
+    if (posmajor) { line = idx / n; k = idx - line * n; }
+    else          { k = idx / nlines; line = idx - k * nlines; }
+    if (line >= nlines || k >= n) return;
+
+    int nev = (n + 1) / 2, nod = n / 2;
+    const int16_t *s = src + (long)line * line_pitch;
+    int16_t *d = dst + (long)line * line_pitch;
+    if (n <= 1) { d[0] = s[0]; return; }
+
+    if (k < nod)
+        d[(long)(nev + k) * stride] = (int16_t)det_at(s, stride, k, nev);
+    if (k < nev) {
+        int dm = det_at(s, stride, mir(k - 1, nod), nev);
+        int dp = det_at(s, stride, mir(k, nod), nev);
+        d[(long)k * stride] = (int16_t)(s[(long)2 * k * stride] + ((dm + dp + 2) >> 2));
+    }
+}
+
+__global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
+                                long line_pitch, long stride, int nlines, int n, int posmajor)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int line, k;
+    if (posmajor) { line = idx / n; k = idx - line * n; }
+    else          { k = idx / nlines; line = idx - k * nlines; }
+    if (line >= nlines || k >= n) return;
+
+    int nev = (n + 1) / 2, nod = n / 2;
+    const int16_t *s = src + (long)line * line_pitch;
+    int16_t *d = dst + (long)line * line_pitch;
+    if (n <= 1) { d[0] = s[0]; return; }
+
+    if (k < nev)
+        d[(long)2 * k * stride] = (int16_t)ev_at(s, stride, k, nev, nod);
+    if (k < nod) {
+        int a = ev_at(s, stride, mir(k, nev), nev, nod);
+        int b = ev_at(s, stride, mir(k + 1, nev), nev, nod);
+        d[(long)(2 * k + 1) * stride] = (int16_t)(s[(long)(nev + k) * stride] + ((a + b) >> 1));
+    }
+}
+
+__global__ void k_enc(const gtab_t * __restrict__ c_tab,
+                      const uint8_t * __restrict__ sym,
                       const uint32_t * __restrict__ soff,
                       const uint32_t * __restrict__ slen,
                       const uint16_t * __restrict__ stab,
@@ -145,7 +173,8 @@ __global__ void k_enc(const uint8_t * __restrict__ sym,
 
 /* Same, without integer division: rcp = floor(2^31/f)+1, invariant x < 2^31, so the
    estimate is exact or one high and a single decrement fixes it. */
-__global__ void k_enc_rcp(const uint8_t * __restrict__ sym,
+__global__ void k_enc_rcp(const gtab_t * __restrict__ c_tab,
+                          const uint8_t * __restrict__ sym,
                           const uint32_t * __restrict__ soff,
                           const uint32_t * __restrict__ slen,
                           const uint16_t * __restrict__ stab,

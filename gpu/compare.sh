@@ -73,16 +73,17 @@ echo
 echo "== this codec (GPU, whole 4:2:2 frame in one launch) =="
 # the GPU has been idle while the CPU codecs ran: warm the clocks before measuring
 head -c $FRAME_BYTES "$D/src.yuv" > "$D/f0.yuv"
-for i in $(seq 1 8); do "$GPU/w5c" enc422 "$D/f0.yuv" "$D/f0.w5c" $W $H 5 >/dev/null 2>&1; done
+# a fresh process pays ~1.5 ms of first-call overhead per kernel type; measure steady state
+for i in 1 2; do W5C_REPEAT=5 "$GPU/w5c" enc422 "$D/f0.yuv" "$D/f0.w5c" $W $H 5 >/dev/null 2>&1; done
 : > "$D/plane.txt"
 for i in $(seq 1 8); do
-  "$GPU/w5c" enc422 "$D/f0.yuv" "$D/f0.w5c" $W $H 5 2>/dev/null | grep -oE "bytes=[0-9]+ enc=[0-9.]+" >> "$D/plane.txt"
+  W5C_REPEAT=10 "$GPU/w5c" enc422 "$D/f0.yuv" "$D/f0.w5c" $W $H 5 2>/dev/null | grep -oE "bytes=[0-9]+ enc=[0-9.]+" >> "$D/plane.txt"
 done
 B=$(grep -oE "bytes=[0-9]+" "$D/plane.txt" | cut -d= -f2 | head -1)
 E=$(grep -oE "enc=[0-9.]+" "$D/plane.txt" | cut -d= -f2 | sort -n | head -1)
 Dm=""
 for i in $(seq 1 8); do
-  "$GPU/w5c" dec422 "$D/f0.w5c" /dev/null 2>/dev/null | grep -oE "dec=[0-9.]+" | cut -d= -f2 >> "$D/dec.txt"
+  W5C_REPEAT=10 "$GPU/w5c" dec422 "$D/f0.w5c" /dev/null 2>/dev/null | grep -oE "dec=[0-9.]+" | cut -d= -f2 >> "$D/dec.txt"
 done
 Dm=$(sort -n "$D/dec.txt" | head -1)
 printf "%-22s %9d B  %6.3f bpp  %8.2f ms/frame  %s\n" \

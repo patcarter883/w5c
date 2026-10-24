@@ -4,6 +4,7 @@
    Build: see Makefile.  Run: ./dwt_gpu [w] [h] [levels] [kind]
 */
 #include "kernels.hi"
+#include "pipeline.hip"
 extern "C" {
 #include "wavelet.h"
 }
@@ -52,25 +53,17 @@ int main(int argc, char **argv)
     gen(gpu.data(), w, h, 10, kind);
     HIPCHECK(hipMemcpy(d, gpu.data(), npx * 2, hipMemcpyHostToDevice));
 
-    const int BS = 256;
-    auto launch = [&](bool fwd, long off, long pitch, long stride, int n, int lines) {
-        size_t sm = (size_t)2 * n * sizeof(int16_t);
-        if (fwd) k_lift1d_fwd<<<lines, BS, sm>>>(d, off, pitch, stride, n);
-        else     k_lift1d_inv<<<lines, BS, sm>>>(d, off, pitch, stride, n);
-        HIPCHECK(hipGetLastError());
-    };
+    (void)cw; (void)ch; (void)nl;
 
     hipEvent_t e0, e1;
     HIPCHECK(hipEventCreate(&e0)); HIPCHECK(hipEventCreate(&e1));
     HIPCHECK(hipDeviceSynchronize());
     HIPCHECK(hipEventRecord(e0));
-    for (int L = 0; L < nl; L++) {
-        launch(true, 0, (long)w, 1, cw[L], ch[L]);          /* rows */
-        launch(true, 0, 1, (long)w, ch[L], cw[L]);          /* cols */
-    }
+    float ms = 0;
+    plane_t PT[1] = {{d, w, h}};
+    plane_dwt_all(PT, 1, levels, true, &ms);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipDeviceSynchronize());
-    float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, e0, e1));
 
     std::vector<int16_t> out(npx);
     HIPCHECK(hipMemcpy(out.data(), d, npx * 2, hipMemcpyDeviceToHost));
@@ -90,10 +83,7 @@ int main(int argc, char **argv)
     if (diff) { printf("FAIL\n"); return 1; }
 
     HIPCHECK(hipEventRecord(e0));
-    for (int L = nl - 1; L >= 0; L--) {
-        launch(false, 0, 1, (long)w, ch[L], cw[L]);         /* cols first */
-        launch(false, 0, (long)w, 1, cw[L], ch[L]);         /* then rows */
-    }
+    plane_dwt_all(PT, 1, levels, false, nullptr);
     HIPCHECK(hipEventRecord(e1));
     HIPCHECK(hipDeviceSynchronize());
     float ms2 = 0; HIPCHECK(hipEventElapsedTime(&ms2, e0, e1));
