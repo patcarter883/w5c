@@ -16,7 +16,35 @@ DUMP=/tmp/d4k ./codec_test 3840 2160 5 0        # writes /tmp/d4k.{sym,enc,tab}
 DUMP=/tmp/d1080 ./codec_test 1920 1080 5 testdata/f0000_g8.y8
 ```
 
-## Correctness
+## GPU transform (5/3 lifting)
+
+Bit-exact against the scalar reference on every configuration tried — forward coefficients
+**and** round-trip pixels, 0 of 8.29 M coefficients differing at 4K.
+
+| size | levels | CPU ref fwd | GPU fwd | speedup |
+|---|---|---|---|---|
+| 1920×1080 | 5 | 11.9 ms | 0.53 ms | 22× |
+| 3840×2160 | 5 | 52.4 ms | 0.98 ms | 54× |
+| 3840×2160 | 4 | 51.7 ms | 0.96 ms | 54× |
+| 1920×1080 | 3 | 11.8 ms | 0.51 ms | 23× |
+| 320×240 | 5 | 0.4 ms | 0.40 ms | ~1× (launch-bound) |
+| 37×23 / 64×64 / 128×96 | 1–5 | — | — | all bit-exact |
+
+**Design:** one work-group per line. Each 1D lift runs as two parallel phases split by a
+barrier — *predict* over detail samples (reads input only), then *update* over approximation
+samples (reads predicted details). So a line lifts in two parallel phases with no transpose,
+and the column pass costs a strided load that the work-group absorbs into shared memory
+rather than a global transpose.
+
+Effective bandwidth at 1080p is ~17 GB/s, which is low for the hardware: one work-group per
+line gives coarse axial parallelism and 256 threads iterating a 1920-element line. It does not
+matter here (the transform is ~0.03% of the codec budget) but it is why this is not a
+300 GB/s kernel — a warp-per-line tiling would be the fix if it ever mattered.
+
+Floor is ~0.4 ms across all sizes: 10 kernel launches of overhead. Irrelevant at HD/4K,
+dominant below ~320×240.
+
+## Entropy correctness
 
 ```
 streams 8428 | symbols 7927243 | tables 64 | ref bytes 5315830 | max stream 5347
