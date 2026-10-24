@@ -290,7 +290,10 @@ cursor: an integer division in that inner loop cost 2x. The remaining parallelis
 
 `./compare.sh 30` — identical source for every codec: 30 frames of 1920x1080 **yuv422p10le**
 converted from real camera stills. Per-frame figures. bpp is **bits per sample** (2 samples
-per pixel in 4:2:2), so all rows are on the same basis.
+per pixel in 4:2:2), so all rows are on the same basis. The trade is not: FFV1 and this codec
+are lossless, while the other four rows are lossy at the quality given in the last column (VC-2
+at tolerance 0 is not bit-exact, and DNxHR HQX and JPEG XS are lossy by design). bpp is therefore
+not a like-for-like comparison between a lossless and a lossy row.
 
 | codec | bytes/frame | bpp | encode ms/frame | quality |
 |---|---|---|---|---|
@@ -302,8 +305,8 @@ per pixel in 4:2:2), so all rows are on the same basis.
 | FFV1 level 3 | 2,451,713 | 4.729 | 31.88 | **lossless** |
 
 Encode-only and decode-only for this codec: **8.56 / 5.26 ms** per 4:2:2 frame at blk=32,
-measured with `w5c` (best of 8). That makes it the fastest encoder in this table — ahead of
-SVT-JPEG-XS at 1.0 bpp — while remaining lossless.
+measured with `w5c` (best of 8). That is the fastest encode in this table; every row it beats is
+lossy and at a lower rate.
 
 > **This table predates two later changes.** Varint container lengths and warp-parallel
 > desymbolise landed after it was measured, so its "this codec" row (5.644 bpp, 8.56/5.26 ms) is
@@ -317,11 +320,13 @@ codec have since moved (see the note above).
 
 1. **Speed.** 10.17 ms encode against FFV1's 31.16 ms on the CPU: 3.1x faster than the other
    lossless codec here, and faster than VC-2 (12.43 ms) and DNxHR HQX (33.36 ms). SVT-JPEG-XS is
-   faster (9.12-10.71 ms) at 1.0-1.5 bpp and is lossy.
+   faster at encoding (9.12-10.71 ms) but is lossy at 1.0-1.5 bpp, so that is a speed
+   comparison at unequal rates, not a rate comparison.
 2. **Rate.** 19% worse than FFV1 in this run (5.644 vs 4.729 bpp): the cost of the smaller
    code-blocks plus no context modelling beyond symbol packing. At blk=64 the gap is 13%
    (5.338 bpp) and the frame costs 30.5/35.2 ms.
-3. **SVT-JPEG-XS.** 40.4-43.4 dB at 1.0-1.5 bpp in under 11 ms. Matching that while remaining
+3. **SVT-JPEG-XS (lossy).** 40.4-43.4 dB at 1.0-1.5 bpp in under 11 ms. It is not lossless, so
+   its rate is not comparable to this codec's; matching its speed at that quality while remaining
    lossless requires context modelling for rate and warp-cooperative symbolisation for speed.
 4. **The VC-2 row is ffmpeg's encoder.** It needs 4.809 bpp to reach 31.8 dB. It is a basic
    encoder rather than a tuned VC-2 implementation, so the row measures ffmpeg, not VC-2's

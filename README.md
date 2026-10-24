@@ -24,8 +24,9 @@ colour conversion.
 All rows bit-exact. `blk` trades rate against parallelism: code-blocks are the work items, so block
 size sets how many independent streams exist.
 
-On the same 1080p 4:2:2 source, FFV1 level 3 runs 4.729 bpp at ~31 ms/frame on the CPU. SVT-JPEG-XS
-reaches 40–43 dB at 1.0–1.5 bpp in ~9–11 ms.
+On the same 1080p 4:2:2 source, FFV1 level 3 runs 4.729 bpp at ~31 ms/frame on the CPU. FFV1 is the
+only other lossless codec here, so that is the only rate comparison on equal terms. SVT-JPEG-XS is
+lossy: 40–43 dB at 1.0–1.5 bpp in ~9–11 ms, and its bitrate is not comparable to a lossless codec's.
 
 ## How it works
 
