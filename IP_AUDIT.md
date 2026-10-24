@@ -237,17 +237,51 @@ traversal. Our grouping of bits into 6-bit symbols is plain bit packing, not an 
 
 ---
 
-## 6. Risk ranking and what counsel needs
+## 6. Litigation status, expiry, and the revised risk ranking
 
-| Rank | Item | Basis |
-|---|---|---|
-| 1 | US 8,934,535 claim 1 | Attribute-driven selection of a compression configuration per portion, followed by an asymmetric coder. Distinguishable on "which compressor" vs "which model", and on measured-and-transmitted vs selected-from-stored-profiles — but it is argument. |
-| 2 | US 11,234,023 claims 2-4 (dependent) | Per-stream flush/re-init and static-model selection per fragment map closely to this design; saved only by the two-phase limitation in claims 1/19/20. |
-| — | Everything else in the set | No counterpart, or expired. |
+Status and term taken from the register for every patent in the set. Expiry is decisive: a lapsed
+patent cannot be infringed under 35 U.S.C. § 271, and this codebase post-dates every expiry below,
+so no past-damages theory survives either.
+
+| Patent | Owner | Filed | Status | Term |
+|---|---|---|---|---|
+| US 8,934,535 B2 | Realtime Data | 2002-02-13 | **Expired — Fee Related** | would have run to 2022-02-13 |
+| US 8,867,610 B2 | Realtime Data | 2002-02-13 | **Expired — Fee Related** | 2022-02-13 |
+| US 7,415,530 B2 | Realtime Data | 1999-03-11 | **Expired — Fee Related** | 2019-03-11 |
+| US 6,650,327 B1 | Graphics Properties Holdings | 1998-06-16 | **Expired — Lifetime** | expired |
+| US 8,832,297 B2 | DivX / Fortress | 2011-12-29 | **Active** | to 2031-12-29 |
+| US 8,378,862 B2 | Malikie Innovations | 2011-07-28 | **Active** | to 2031-10-13 |
+| US 8,392,598 B2 | Malikie Innovations | 2010-06-14 | **Active** | to 2031-05-29 |
+| US 11,234,023 B2 | Microsoft | 2019-06-28 | **Active** | to 2039-06-28 |
+
+Two consequences, and the second is the one that matters:
+
+1. **The entire Realtime Data branch of the audit is dead.** All three patents, including the one
+   that read closest on the code (§5.2), expired or lapsed. The §5.2 analysis stands as reasoning
+   but is no longer load-bearing. Expiry clears the family, not just the one patent.
+2. **Four patents remain live, and for those the clearance rests on non-infringement alone** — not
+   on expiry. US 8,832,297, US 8,378,862 and US 8,392,598 run to 2031; US 11,234,023 to 2039.
+   Their §5 analyses found no counterpart to any claim element, which is the finding that has to
+   hold. Do not let the expiry of the Realtime Data group generalise into comfort about these.
+
+### Revised ranking
+
+| Rank | Item | Status | Basis |
+|---|---|---|---|
+| 1 | US 11,234,023 B2 (Microsoft), incl. dependent claims 2–4 | **Live to 2039** | Two-phase deferred/predicated emission absent from claims 1/19/20 (§5.1). Effective priority is **2019-06-28** with no earlier parent, so `ryg_rans` (Feb 2014) and Duda (Nov 2013) are §102 prior art by more than five years — non-infringement *and* invalidity anchors both hold. |
+| 2 | US 8,832,297 / 8,378,862 / 8,392,598 | **Live to 2031** | No counterpart to any claim element: no ABR ladder or client signalling; no 2^L-ary adaptive tree coder; no sessionless client adaptation (§5.4). |
+| 3 | Realtime Data family (8,934,535 / 8,867,610 / 7,415,530) | **Expired** | No exposure, §271. The §5.2 reasoning is retained for the record. |
+| 4 | US 6,650,327 | **Expired** | Rasterisation; expired. |
+| — | **intoPIX / JPEG XS estate** | **LIVE — see §7** | Not part of the brief's list and not cleared by any of the above. This is where the remaining exposure actually sits. |
+
+**The headline is not "clear".** The patents in the brief are now accounted for — four expired, four
+live but without claim-element counterparts. But the commercially significant estate is the JPEG XS
+pool in §7, which is live, FRAND-licensed, and architecturally the closest thing to this codec of
+anything examined. A clean result on the brief's list does not carry over to it.
 
 To finish properly: the file histories (continuations, reexaminations, terminal disclaimers) for
-8,934,535 and 11,234,023; the priority dates, since ryg_rans (Feb 2014) is not prior art to
-anything claiming earlier; and counsel's construction of "access profile" and "compressor".
+US 11,234,023, since it is live and its dependent claims map uncomfortably closely; and counsel's
+construction of "access profile" and "compressor" if the Realtime Data analysis is ever revived.
 
 ---
 
