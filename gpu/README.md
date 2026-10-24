@@ -2,10 +2,10 @@
 
 ## Provenance
 
-Every coding tool here is traceable to **SMPTE ST 2042-1 (VC-2, first edition 2008)** and the public
-Dirac specification it grew from, both royalty-free: 5/3 integer lifting, slice-independent
-transform restart at a horizontal band boundary, per-(level, orientation) subband handling, and
-magnitude coding with the sign carried separately. The entropy stage is **rANS** — Duda
+The wavelet, slice and subband tools are traceable to **SMPTE ST 2042-1 (VC-2, first edition 2008)**
+and the public Dirac specification it grew from, both royalty-free: 5/3 integer lifting,
+slice-independent transform restart at a horizontal band boundary, per-(level, orientation) subband
+handling, and magnitude coding with the sign carried separately. The entropy stage is **rANS** — Duda
 (arXiv:1311.2540, Nov 2013) and Giesen's `ryg_rans` (Feb 2014) — which is not a VC-2 tool, and is
 prior art to the 2016-onward JPEG XS patent filings. The warp-cooperative desymboliser is original
 to this codebase.

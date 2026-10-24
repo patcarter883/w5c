@@ -7,8 +7,9 @@ This document specifies the bytes on the wire, independently of the implementati
 document and the code disagree, the code is wrong and should be fixed, or this document is stale and
 should be updated in the same commit.
 
-Not a standards-track document, and **not bit-stream compatible** with VC-2 or JPEG XS. The coding
-tools are traceable to VC-2/Dirac (see `IP_AUDIT.md` §7); the entropy stage is rANS.
+W5C is an independent codec. Its coding tools are drawn from published literature — the transform
+and slice structure from VC-2/Dirac, the entropy stage from rANS (see `IP_AUDIT.md` §7) — and this
+document is the complete specification of the format it produces.
 
 ---
 

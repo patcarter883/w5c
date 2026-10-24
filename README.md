@@ -4,9 +4,9 @@ A **GPU-accelerated lossless wavelet codec**: reversible 5/3 integer lifting, bi
 and rANS entropy coding, written in HIP for AMD GPUs and verified bit-exact against a scalar C
 reference implementation.
 
-It began as an experiment — what VC-2 could have become if it had been designed with a modern GPU
-available. VC-2's arithmetic survives; its serial entropy stage is replaced with a frame's worth of
-independent rANS streams.
+w5c is its own codec, inspired by VC-2: the wavelet arithmetic survives, and the serial entropy stage
+is replaced with a frame's worth of independent rANS streams. It is roughly what VC-2 could have
+become if it had been designed with a modern GPU available.
 
 **Status: MVP.** Lossless only. One frame at a time. No rate control, no muxing, no audio, no
 colour conversion.
@@ -82,12 +82,11 @@ configuration is rejected with an explanation instead of crashing.
 
 ## Provenance and licence
 
-Every coding tool traces to **SMPTE ST 2042-1 (VC-2, first edition 2008)** and the public Dirac
-specification it grew from, both royalty-free: 5/3 integer lifting, slice-independent transform
-restart, per-subband coding, and magnitude carried separately from sign. The entropy stage is
-**rANS** — Duda (arXiv:0902.0271, 2009; arXiv:1311.2540, 2013) and Giesen's `ryg_rans` (2014) —
-which is not a VC-2 tool, but predates the JPEG XS patent filings. The warp-cooperative
-desymboliser is original to this project.
+The wavelet, slice and subband tools trace to **SMPTE ST 2042-1 (VC-2, first edition 2008)** and the
+public Dirac specification it grew from, both royalty-free: 5/3 integer lifting, slice-independent
+transform restart, per-subband coding, and magnitude carried separately from sign. The entropy stage
+is our own choice of **rANS** — Duda (arXiv:0902.0271, 2009; arXiv:1311.2540, 2013) and Giesen's
+`ryg_rans` (2014). The warp-cooperative desymboliser is original to this project.
 
 This matters because JPEG XS has a live FRAND patent pool (Fraunhofer IIS and intoPIX, via Vectis
 IP) while VC-2 is royalty-free, and an implementation this shape is close enough to JPEG XS for the
@@ -101,7 +100,6 @@ Apache-2.0; see `LICENSE`. Contributions require DCO sign-off; see `CONTRIBUTING
 ## Limits
 
 - **Lossless only.** There is no lossy mode and no quantiser.
-- **Not conformant** to VC-2 or JPEG XS. It shares coding tools with VC-2, not a bitstream.
 - **Rate is worse than FFV1** by 12–15%. The time advantage is real; the compression advantage is not.
 - **Timings are content-dependent.** Real camera frames cost notably more than synthetic content
   because they carry more significant coefficients. Figures above are steady state, best-of-N, on an
