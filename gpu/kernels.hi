@@ -57,6 +57,16 @@ __device__ __forceinline__ v2s v2abs(v2s v)
     return r;
 }
 
+/* The classification of one coefficient. Both the packed and the scalar classify loops call
+   this: they differ only in how the magnitude is fetched and how fast they advance, so the
+   branch logic exists once. */
+__device__ __forceinline__ void classify(int m, int p, int newly, int k,
+                                         uint32_t &amask, uint32_t &qmask, int &csig, int &cref)
+{
+    if (m >> (p + 1)) { amask |= 1u << k; cref++; }
+    else if (newly)   { qmask |= 1u << k; csig++; }
+}
+
 __device__ __forceinline__ int mir(int i, int n)
 {
     while (i < 0 || i >= n) {
@@ -686,21 +696,16 @@ __global__ void k_desym_w(const uint8_t * __restrict__ bits,
             /* whole rows, contiguous: two coefficients per load, arithmetic packed */
             int16_t *rp = base + (size_t)cy * pw;
             for (int k = 0; k < cnt; k += 2) {
-                v2s v = *(const v2s *)&rp[k];
-                v2s m = v2abs(v);
-                int m0 = m[0], m1 = m[1];
-                if (m0 >> (p + 1)) { amask |= 1u << k; cref++; }
-                else if (newly) { qmask |= 1u << k; csig++; }
-                if (m1 >> (p + 1)) { amask |= 1u << (k + 1); cref++; }
-                else if (newly) { qmask |= 1u << (k + 1); csig++; }
+                v2s m = v2abs(*(const v2s *)&rp[k]);
+                classify(m[0], p, newly, k, amask, qmask, csig, cref);
+                classify(m[1], p, newly, k + 1, amask, qmask, csig, cref);
             }
         } else {
             int16_t *rp = base + (size_t)cy * pw;
             int tx = cx;
             for (int k = 0; k < cnt; k++) {
                 int m = rp[tx]; if (m < 0) m = -m;
-                if (m >> (p + 1)) { amask |= 1u << k; cref++; }
-                else if (newly) { qmask |= 1u << k; csig++; }
+                classify(m, p, newly, k, amask, qmask, csig, cref);
                 if (++tx == bw) { tx = 0; rp += pw; }
             }
         }
