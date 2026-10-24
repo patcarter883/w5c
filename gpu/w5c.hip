@@ -91,6 +91,10 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     }
 
     float ms_fwd = 0;
+    int qp = 0;
+    if (const char *e = getenv("W5C_QP")) qp = atoi(e);
+    int slice_h = 0;
+    if (const char *e = getenv("W5C_SLICE")) slice_h = atoi(e);
 
     /* W5C_REPEAT repeats the whole encode in-process. A single run pays ~2 ms of cold start
        (first kernel of each type), which is meaningless for a codec that runs per frame. */
@@ -105,7 +109,23 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
         /* the transform is in place, so each repeat starts from the pristine samples */
         if (r) for (int i = 0; i < np; i++)
             HIPCHECK(hipMemcpy(P[i].d, img[i].data(), (size_t)P[i].w * P[i].h * 2, hipMemcpyHostToDevice));
-        plane_dwt_all(P, np, levels, true, &t);
+        plane_dwt_all(P, np, levels, true, &t, slice_h);
+        if (qp > 0)
+            for (int i = 0; i < np; i++) {
+                subband_t sb[64];
+                int nsb = dwt53_subbands(P[i].w, P[i].h, levels, sb, 64);
+                for (int b = 0; b < nsb; b++) {
+                    /* visual weighting: fine/high-frequency bands carry least of the perceived
+                       image, so they take the coarsest step; LL is barely touched */
+                    int sh = (sb[b].orient == 0) ? (qp > 4 ? qp - 4 : 0)
+                                                 : qp + (levels - sb[b].level) - 2
+                                                    + (sb[b].orient == 3 ? 1 : 0);
+                    if (sh < 0) sh = 0;
+                    if (!sh) continue;
+                    dim3 bs(32, 4), gr((sb[b].w + 31) / 32, (sb[b].h + 3) / 4);
+                    k_quant_rect<<<gr, bs>>>(P[i].d, P[i].w, sb[b].x, sb[b].y, sb[b].w, sb[b].h, sh);
+                }
+            }
         if (getenv("W5C_DIAG")) {
             std::vector<int16_t> chk((size_t)P[0].w * P[0].h);
             HIPCHECK(hipMemcpy(chk.data(), P[0].d, chk.size() * 2, hipMemcpyDeviceToHost));
@@ -113,7 +133,7 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
             for (size_t i = 0; i < chk.size(); i++) { s1 += chk[i]; s2 += llabs((long long)chk[i]); if (chk[i]) nz++; }
             printf("    [diag] iter %d coef sum=%lld abs=%lld nz=%ld\n", r, s1, s2, nz);
         }
-        if (!gpu_encode_frame(P, np, levels, blk, bits, &sm)) { fprintf(stderr, "encode failed\n"); return 1; }
+        if (!gpu_encode_frame(P, np, levels, blk, bits, &sm, slice_h)) { fprintf(stderr, "encode failed\n"); return 1; }
         if (!write_file(outp, bits.data(), bits.size())) return 1;
         double tot = t + sm.sym + sm.pack + sm.hist + sm.enc;
         if (r == 0 || tot < best) { best = tot; best_sm = sm; ms_fwd = t; }
@@ -122,8 +142,8 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
 
     double px = (double)w * h * (yuv422 ? 2.0 : 1.0);   /* 4:2:2 = 2 samples per pixel */
     double tot = rep > 1 ? best : ms_fwd + sm.sym + sm.pack + sm.hist + sm.enc;
-    printf("%s: %dx%d%s levels=%d blk=%d  %zu B  %.3f bpp  %zu -> %zu bytes\n",
-           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, bits.size(),
+    printf("%s: %dx%d%s levels=%d blk=%d slice=%d  %zu B  %.3f bpp  %zu -> %zu bytes\n",
+           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, slice_h, bits.size(),
            (double)bits.size() * 8.0 / px, raw.size(), bits.size());
     printf("  fwd %.2f ms  sym %.2f  pack %.2f  hist %.2f  enc %.2f  = %.2f ms\n",
            ms_fwd, sm.sym, sm.pack, sm.hist, sm.enc, tot);
@@ -138,8 +158,8 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     if (!read_file(inp, bits)) return 1;
 
     plane_t P[W5C_MAXPLANES] = {};
-    int np = 0, levels = 0, blk = 0;
-    if (!gpu_frame_dims(bits.data(), bits.size(), P, &np, &levels, &blk)) {
+    int np = 0, levels = 0, blk = 0, slice_h = 0;
+    if (!gpu_frame_dims(bits.data(), bits.size(), P, &np, &levels, &blk, &slice_h)) {
         fprintf(stderr, "%s: not a w5c bitstream\n", inp);
         return 1;
     }
@@ -160,7 +180,7 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     for (int r = 0; r < rep; r++) {
         float t = 0;
         if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
-        plane_dwt_all(P, np, levels, false, &t);
+        plane_dwt_all(P, np, levels, false, &t, slice_h);
         double tot = sm.dec + sm.desym + t;
         if (r == 0 || tot < best) { best = tot; best_sm = sm; best_inv = t; }
     }

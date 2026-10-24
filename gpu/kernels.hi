@@ -88,9 +88,34 @@ __device__ __forceinline__ int ev_at(const int16_t *s, long stride, int j, int n
     return (int16_t)(s[(long)j * stride] - ((dm + dp + 2) >> 2));
 }
 
-__global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
-                                long line_pitch, long stride, int nlines, int n, int posmajor)
+/* Lossy mode costs nothing in the container: truncating low bitplanes before symbolisation
+   means the decoder reconstructs exactly what was coded, so no quantiser side information is
+   needed. The bitplane count follows automatically because k_block_mb measures the truncated
+   coefficients. */
+__global__ void k_quant_rect(int16_t * __restrict__ buf, long pitch,
+                             int x0, int y0, int w, int h, int shift)
 {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int16_t *p = &buf[(long)(y0 + y) * pitch + x0 + x];
+    int v = *p;
+    *p = (int16_t)((v >> shift) << shift);
+}
+
+/* A slice list, passed by value so one launch can carry every slice of a frame. Without this the
+   transform launches once per slice per level per axis, and at 60-line slices that was 540 small
+   launches costing 3.2 ms against 0.36 ms of work. */
+#define W5C_MAXSLICE 32
+struct spr { int y0[W5C_MAXSLICE]; int nl[W5C_MAXSLICE]; int n[W5C_MAXSLICE]; };
+
+__global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
+                                long y0_step, long line_pitch, long stride,
+                                int posmajor, spr sp, int ns)
+{
+    int sl = blockIdx.y;
+    if (sl >= ns) return;
+    int n = sp.n[sl], nlines = sp.nl[sl];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int line, k;
     if (posmajor) { line = idx / n; k = idx - line * n; }
@@ -98,8 +123,9 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
     if (line >= nlines || k >= n) return;
 
     int nev = (n + 1) / 2, nod = n / 2;
-    const int16_t *s = src + (long)line * line_pitch;
-    int16_t *d = dst + (long)line * line_pitch;
+    long org = (long)sp.y0[sl] * y0_step;
+    const int16_t *s = src + org + (long)line * line_pitch;
+    int16_t *d = dst + org + (long)line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (k < nod)
@@ -112,8 +138,12 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
 }
 
 __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
-                                long line_pitch, long stride, int nlines, int n, int posmajor)
+                                long y0_step, long line_pitch, long stride,
+                                int posmajor, spr sp, int ns)
 {
+    int sl = blockIdx.y;
+    if (sl >= ns) return;
+    int n = sp.n[sl], nlines = sp.nl[sl];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int line, k;
     if (posmajor) { line = idx / n; k = idx - line * n; }
@@ -121,8 +151,9 @@ __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __re
     if (line >= nlines || k >= n) return;
 
     int nev = (n + 1) / 2, nod = n / 2;
-    const int16_t *s = src + (long)line * line_pitch;
-    int16_t *d = dst + (long)line * line_pitch;
+    long org = (long)sp.y0[sl] * y0_step;
+    const int16_t *s = src + org + (long)line * line_pitch;
+    int16_t *d = dst + org + (long)line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
     if (k < nev)

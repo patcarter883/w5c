@@ -65,28 +65,37 @@ static bool plane_geometry(int w, int h, int levels, int blk, plane_geom *g)
 
 /* --------------------------------------------------------------- encode */
 static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
-                             std::vector<uint8_t> &out, stage_ms *sm)
+                             std::vector<uint8_t> &out, stage_ms *sm, int slice_h)
 {
     stage_ms z = {0, 0, 0, 0, 0, 0, 0, 0};
     if (sm) *sm = z;
     if (np < 1 || np > W5C_MAXPLANES) return false;
 
-    static plane_geom g[W5C_MAXPLANES];
-    int nb_total = 0, ns_total = 0, ntab = 0;
+    /* A slice is encoded as its own image: own transform, own subbands, own code-blocks. What it
+       does NOT get is its own probability tables - those stay frame-wide, which is what keeps the
+       rate cost of slicing down to the transform restart (measured +0.3% at 120 lines). */
+    static plane_geom g;
+    std::vector<bdesc> bds;
+    std::vector<int> btab;
+    int ns_total = 0, ntab = 0;
     for (int i = 0; i < np; i++) {
-        if (!plane_geometry(P[i].w, P[i].h, levels, blk, &g[i])) return false;
-        for (int b = 0; b < g[i].nblocks; b++) { g[i].bd[b].pl = P[i].d; g[i].bd[b].pw = P[i].w; }
-        nb_total += g[i].nblocks;
-        ns_total += g[i].nstreams;
-        ntab = g[i].ntab;
+        int sh = (slice_h > 0 && slice_h < P[i].h) ? slice_h : P[i].h;
+        for (int y0 = 0; y0 < P[i].h; y0 += sh) {
+            int hs = (P[i].h - y0 < sh) ? (P[i].h - y0) : sh;
+            if (!plane_geometry(P[i].w, hs, levels, blk, &g)) return false;
+            for (int b = 0; b < g.nblocks; b++) {
+                bdesc d = g.bd[b];
+                d.y0 += y0; d.pl = P[i].d; d.pw = P[i].w;
+                bds.push_back(d);
+                btab.push_back(g.bsub[b]);
+            }
+            ns_total += g.nstreams;
+            ntab = g.ntab;
+        }
     }
+    int nb_total = (int)bds.size();
     if (nb_total > W5C_MAXBLK) return false;
     int nbs = (ns_total + 127) / 128;
-
-    /* one block list across all planes, so every launch below sees the whole frame */
-    std::vector<bdesc> bds;
-    bds.reserve(nb_total);
-    for (int i = 0; i < np; i++) bds.insert(bds.end(), g[i].bd, g[i].bd + g[i].nblocks);
 
     bdesc *d_bd; HIPCHECK(hipMalloc(&d_bd, nb_total * sizeof(bdesc)));
     HIPCHECK(hipMemcpy(d_bd, bds.data(), nb_total * sizeof(bdesc), hipMemcpyHostToDevice));
@@ -95,24 +104,20 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     HIPCHECK(hipMemcpy(bds.data(), d_bd, nb_total * sizeof(bdesc), hipMemcpyDeviceToHost));
 
     std::vector<sdesc> desc(ns_total);
-    {
-        int sb_base = 0, bb = 0;
-        for (int i = 0; i < np; i++) {
-            for (int b = 0; b < g[i].nblocks; b++, bb++) {
-                const bdesc &d = bds[bb];
-                for (int c = 0; c < 4; c++) {
-                    sdesc &e = desc[bb * 4 + c];
-                    e.x0 = d.x0; e.y0 = d.y0; e.bw = d.bw; e.bh = d.bh; e.mb = d.mb;
-                    e.ctx = c; e.tab = g[i].bsub[b] * 4 + c;
-                    e.pl = P[i].d; e.pw = P[i].w; e.bi = bb;
-                }
-            }
+    for (int bb = 0; bb < nb_total; bb++) {
+        const bdesc &d = bds[bb];
+        int pl = 0;
+        for (int i = 0; i < np; i++) if (P[i].d == d.pl) { pl = i; break; }
+        for (int c = 0; c < 4; c++) {
+            sdesc &e = desc[bb * 4 + c];
+            e.x0 = d.x0; e.y0 = d.y0; e.bw = d.bw; e.bh = d.bh; e.mb = d.mb;
+            e.ctx = c; e.tab = btab[bb] * 4 + c;
+            e.pl = d.pl; e.pw = d.pw; e.bi = bb;
         }
-        (void)sb_base;
+        (void)pl;
     }
     sdesc *d_desc; HIPCHECK(hipMalloc(&d_desc, ns_total * sizeof(sdesc)));
     HIPCHECK(hipMemcpy(d_desc, desc.data(), ns_total * sizeof(sdesc), hipMemcpyHostToDevice));
-
     /* fixed worst-case bit stride: the emit pass is the only walk */
     uint32_t stride = 1;
     for (int i = 0; i < ns_total; i++) {
@@ -253,7 +258,7 @@ static bool gpu_encode_frame(plane_t *P, int np, int levels, int blk,
     auto put32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t *)&v, (uint8_t *)&v + 4); };
     put32(W5C_MAGIC); put32((uint32_t)np); put32((uint32_t)levels);
     put32((uint32_t)nb_total); put32((uint32_t)ns_total); put32((uint32_t)ntab);
-    put32((uint32_t)blk); put32(0);
+    put32((uint32_t)blk); put32((uint32_t)(slice_h > 0 ? slice_h : 0));
     for (int i = 0; i < np; i++) { put32((uint32_t)P[i].w); put32((uint32_t)P[i].h); }
     out.insert(out.end(), (uint8_t *)freqs.data(), (uint8_t *)freqs.data() + freqs.size() * 2);
     for (int i = 0; i < nb_total; i++) out.push_back((uint8_t)bds[i].mb);
@@ -303,7 +308,7 @@ static bool w5c_payload_span(const uint8_t *in, size_t inlen, size_t *off, size_
 /* --------------------------------------------------------------- decode */
 /* Reads the header so the caller can allocate the planes before decoding. */
 static bool gpu_frame_dims(const uint8_t *in, size_t inlen, plane_t *P, int *np_out,
-                           int *levels, int *blk)
+                           int *levels, int *blk, int *slice_h)
 {
     if (inlen < 32) return false;
     const uint32_t *h = (const uint32_t *)in;
@@ -312,7 +317,7 @@ static bool gpu_frame_dims(const uint8_t *in, size_t inlen, plane_t *P, int *np_
     if (np < 1 || np > W5C_MAXPLANES) return false;
     if (inlen < 32 + (size_t)np * 8) return false;
     for (int i = 0; i < np; i++) { P[i].w = (int)h[8 + i * 2]; P[i].h = (int)h[9 + i * 2]; }
-    *np_out = np; *levels = (int)h[2]; *blk = (int)h[6];
+    *np_out = np; *levels = (int)h[2]; *blk = (int)h[6]; *slice_h = (int)h[7];
     return true;
 }
 
@@ -323,6 +328,7 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     if (h32[0] != W5C_MAGIC) return false;
     int hnp = (int)h32[1], levels = (int)h32[2];
     int nb_total = (int)h32[3], ns_total = (int)h32[4], ntab = (int)h32[5], blk = (int)h32[6];
+    int slice_h = (int)h32[7];
     if (hnp != np || np < 1 || np > W5C_MAXPLANES) return false;
 
     size_t p = 32 + (size_t)np * 8;
@@ -331,19 +337,25 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     std::vector<uint16_t> freqs((size_t)ntab * NSYM);
     memcpy(freqs.data(), in + p, freqs.size() * 2); p += freqs.size() * 2;
 
-    static plane_geom g[W5C_MAXPLANES];
-    int nb_chk = 0, ns_chk = 0;
-    for (int i = 0; i < np; i++) {
-        if (!plane_geometry(P[i].w, P[i].h, levels, blk, &g[i])) return false;
-        for (int b = 0; b < g[i].nblocks; b++) { g[i].bd[b].pl = P[i].d; g[i].bd[b].pw = P[i].w; }
-        nb_chk += g[i].nblocks;
-        ns_chk += g[i].nstreams;
-    }
-    if (nb_chk != nb_total || ns_chk != ns_total) return false;
-
+    static plane_geom g;
     std::vector<bdesc> bds;
-    bds.reserve(nb_total);
-    for (int i = 0; i < np; i++) bds.insert(bds.end(), g[i].bd, g[i].bd + g[i].nblocks);
+    std::vector<int> btab;
+    int ns_chk = 0;
+    for (int i = 0; i < np; i++) {
+        int sh = (slice_h > 0 && slice_h < P[i].h) ? slice_h : P[i].h;
+        for (int y0 = 0; y0 < P[i].h; y0 += sh) {
+            int hs = (P[i].h - y0 < sh) ? (P[i].h - y0) : sh;
+            if (!plane_geometry(P[i].w, hs, levels, blk, &g)) return false;
+            for (int b = 0; b < g.nblocks; b++) {
+                bdesc d = g.bd[b];
+                d.y0 += y0; d.pl = P[i].d; d.pw = P[i].w;
+                bds.push_back(d);
+                btab.push_back(g.bsub[b]);
+            }
+            ns_chk += g.nstreams;
+        }
+    }
+    if ((int)bds.size() != nb_total || ns_chk != ns_total) return false;
     for (int b = 0; b < nb_total; b++) { bds[b].mb = (int)in[p]; p += 1; }
 
     std::vector<uint32_t> nsym(ns_total), plen(ns_total), soff(ns_total + 1), eoff(ns_total + 1);
@@ -402,12 +414,8 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     HIPCHECK(hipMemcpy(d_eo, eoff.data(), ns_total * 4, hipMemcpyHostToDevice));
     HIPCHECK(hipMemcpy(d_el, plen.data(), ns_total * 4, hipMemcpyHostToDevice));
     { std::vector<uint16_t> stab(ns_total);
-      int sb_base = 0, bb = 0;
-      for (int i = 0; i < np; i++) {
-          for (int b = 0; b < g[i].nblocks; b++, bb++)
-              for (int c = 0; c < 4; c++) stab[bb * 4 + c] = (uint16_t)(g[i].bsub[b] * 4 + c);
-      }
-      (void)sb_base;
+      for (int b = 0; b < nb_total; b++)
+          for (int c = 0; c < 4; c++) stab[b * 4 + c] = (uint16_t)(btab[b] * 4 + c);
       HIPCHECK(hipMemcpy(d_stab, stab.data(), ns_total * 2, hipMemcpyHostToDevice)); }
     HIPCHECK(hipMemset(d_err, 0, ns_total * 4));
 
@@ -461,38 +469,41 @@ static bool gpu_decode_frame(const uint8_t *in, size_t inlen, plane_t *P, int np
     return true;
 }
 
-/* Forward / inverse transform for a whole set of planes.
-
-   Two coalesced passes per axis per level, ping-ponging between the plane and a cached scratch
-   buffer because the packed subband layout overwrites the source positions.
-
-   Everything runs on the default stream. Per-plane streams were tried and measured as no help
-   (dispatch is ~0.7 us and the transform is memory-bound); they were also a correctness hazard,
-   because a non-blocking stream does not wait for the default stream that just uploaded the
-   samples, so the first call after an upload could transform a half-written plane. */
-static void split_launch(bool fwd, hipStream_t st, const int16_t *src, int16_t *dst,
-                         long line_pitch, long stride, int nlines, int n, int posmajor)
+/* One launch carries every slice of a plane at one level and axis. The slice list is small and
+   passed by value, so the per-slice restart costs no extra dispatch. */
+static void split_launch(bool fwd, const int16_t *src, int16_t *dst, long y0_step,
+                         long line_pitch, long stride, int posmajor,
+                         const spr &sp, int ns)
 {
-    int nev = (n + 1) / 2;
-    /* position-major enumerates (line, position) so it needs all n positions per line, and the
-       upper half simply falls through; line-major enumerates (position, line) and needs only the
-       nev useful positions */
-    long threads = posmajor ? (long)nlines * n : (long)nlines * nev;
-    if (threads <= 0) return;
-    int grid = (int)((threads + 255) / 256);
-    if (fwd) k_dwt_fwd_split<<<grid, 256, 0, st>>>(src, dst, line_pitch, stride, nlines, n, posmajor);
-    else     k_dwt_inv_split<<<grid, 256, 0, st>>>(src, dst, line_pitch, stride, nlines, n, posmajor);
+    if (ns <= 0) return;
+    long most = 0;
+    for (int i = 0; i < ns; i++) {
+        int n = sp.n[i], nl = sp.nl[i];
+        long t = posmajor ? (long)nl * n : (long)nl * ((n + 1) / 2);
+        if (t > most) most = t;
+    }
+    if (most <= 0) return;
+    dim3 grid((unsigned)((most + 255) / 256), (unsigned)ns);
+    if (fwd) k_dwt_fwd_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns);
+    else     k_dwt_inv_split<<<grid, 256>>>(src, dst, y0_step, line_pitch, stride, posmajor, sp, ns);
 }
 
-static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms)
+/* Forward / inverse transform, slice by slice.
+
+   Two coalesced passes per axis per level, ping-ponging between the plane and a cached scratch
+   buffer because the packed subband layout overwrites the source positions. A slice is
+   transformed as an independent image: the row and column passes are simply pointed at the
+   slice's first line, and level_sizes() is evaluated for the slice height. That restart is what
+   bounds latency to a slice, at a measured rate cost of a fraction of a percent.
+
+   Everything runs on the default stream; per-plane streams were tried and measured as no help,
+   and non-blocking streams raced the upload that feeds them. */
+static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms, int slice_h)
 {
     static int16_t *scr[W5C_MAXPLANES];
     static size_t scrn[W5C_MAXPLANES];
     static bool init = false;
-    if (!init) {
-        for (int i = 0; i < W5C_MAXPLANES; i++) { scr[i] = nullptr; scrn[i] = 0; }
-        init = true;
-    }
+    if (!init) { for (int i = 0; i < W5C_MAXPLANES; i++) { scr[i] = nullptr; scrn[i] = 0; } init = true; }
 
     auto t0 = std::chrono::steady_clock::now();
     for (int k = 0; k < np; k++) {
@@ -502,18 +513,37 @@ static void plane_dwt_all(plane_t *P, int np, int levels, bool fwd, float *ms)
             HIPCHECK(hipMalloc(&scr[k], need));
             scrn[k] = need;
         }
-        int cw[16], ch[16];
-        int nl = level_sizes(P[k].w, P[k].h, levels, cw, ch);
+        int sh = (slice_h > 0 && slice_h < P[k].h) ? slice_h : P[k].h;
+        int ns = (P[k].h + sh - 1) / sh;
+        if (ns > W5C_MAXSLICE) { fprintf(stderr, "too many slices (%d)\n", ns); ns = W5C_MAXSLICE; }
+
+        int hs[W5C_MAXSLICE], y0[W5C_MAXSLICE];
+        for (int i = 0; i < ns; i++) {
+            y0[i] = i * sh;
+            hs[i] = (P[k].h - y0[i] < sh) ? (P[k].h - y0[i]) : sh;
+        }
+        int cw0[16], ch0[16];
+        int nl = level_sizes(P[k].w, hs[0], levels, cw0, ch0);
         for (int L = 0; L < nl; L++) {
             int i = fwd ? L : nl - 1 - L;
+            /* rows: positions = cw_i (width only), lines = ch_i (depends on slice height);
+               columns: positions = ch_i, lines = cw_i */
+            spr rows, cols;
+            int cw = 0;
+            for (int t = 0; t < ns; t++) {
+                int c[16], h[16];
+                level_sizes(P[k].w, hs[t], levels, c, h);
+                rows.y0[t] = y0[t]; rows.nl[t] = h[i]; rows.n[t] = c[i];
+                cols.y0[t] = y0[t]; cols.nl[t] = c[i]; cols.n[t] = h[i];
+                cw = c[i];
+            }
+            (void)cw;
             if (fwd) {
-                /* rows into scratch, then columns back into the plane */
-                split_launch(true, 0, P[k].d, scr[k], (long)P[k].w, 1, ch[i], cw[i], 1);
-                split_launch(true, 0, scr[k], P[k].d, 1, (long)P[k].w, cw[i], ch[i], 0);
+                split_launch(true, P[k].d, scr[k], (long)P[k].w, (long)P[k].w, 1, 1, rows, ns);
+                split_launch(true, scr[k], P[k].d, (long)P[k].w, 1, (long)P[k].w, 0, cols, ns);
             } else {
-                /* inverse undoes columns first, then rows */
-                split_launch(false, 0, P[k].d, scr[k], 1, (long)P[k].w, cw[i], ch[i], 0);
-                split_launch(false, 0, scr[k], P[k].d, (long)P[k].w, 1, ch[i], cw[i], 1);
+                split_launch(false, P[k].d, scr[k], (long)P[k].w, 1, (long)P[k].w, 0, cols, ns);
+                split_launch(false, scr[k], P[k].d, (long)P[k].w, (long)P[k].w, 1, 1, rows, ns);
             }
         }
     }
