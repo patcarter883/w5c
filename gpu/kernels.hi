@@ -111,7 +111,7 @@ struct spr { int y0[W5C_MAXSLICE]; int nl[W5C_MAXSLICE]; int n[W5C_MAXSLICE]; };
 
 __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
                                 long y0_step, long line_pitch, long stride,
-                                int posmajor, spr sp, int ns)
+                                int posmajor, spr sp, int ns, int wav)
 {
     int sl = blockIdx.y;
     if (sl >= ns) return;
@@ -128,18 +128,31 @@ __global__ void k_dwt_fwd_split(const int16_t * __restrict__ src, int16_t * __re
     int16_t *d = dst + org + (long)line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
-    if (k < nod)
-        d[(long)(nev + k) * stride] = (int16_t)det_at(s, stride, k, nev);
-    if (k < nev) {
-        int dm = det_at(s, stride, mir(k - 1, nod), nev);
-        int dp = det_at(s, stride, mir(k, nod), nev);
-        d[(long)k * stride] = (int16_t)(s[(long)2 * k * stride] + ((dm + dp + 2) >> 2));
+    if (wav) {
+        /* Haar (1/1): the detail needs only its own pair, so there is no neighbour to fetch and
+           no vertical support beyond one line - that is the property that would make a slice
+           restart nearly free. */
+        int a = 0, b = 0, dd = 0;
+        if (k < nod) { a = s[(long)2 * k * stride]; b = s[(long)(2 * k + 1) * stride]; dd = b - a;
+                       d[(long)(nev + k) * stride] = (int16_t)dd; }
+        if (k < nev) {
+            int ev = s[(long)2 * k * stride];
+            d[(long)k * stride] = (int16_t)(ev + (dd >> 1));
+        }
+    } else {
+        if (k < nod)
+            d[(long)(nev + k) * stride] = (int16_t)det_at(s, stride, k, nev);
+        if (k < nev) {
+            int dm = det_at(s, stride, mir(k - 1, nod), nev);
+            int dp = det_at(s, stride, mir(k, nod), nev);
+            d[(long)k * stride] = (int16_t)(s[(long)2 * k * stride] + ((dm + dp + 2) >> 2));
+        }
     }
 }
 
 __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __restrict__ dst,
                                 long y0_step, long line_pitch, long stride,
-                                int posmajor, spr sp, int ns)
+                                int posmajor, spr sp, int ns, int wav)
 {
     int sl = blockIdx.y;
     if (sl >= ns) return;
@@ -156,12 +169,23 @@ __global__ void k_dwt_inv_split(const int16_t * __restrict__ src, int16_t * __re
     int16_t *d = dst + org + (long)line * line_pitch;
     if (n <= 1) { d[0] = s[0]; return; }
 
-    if (k < nev)
-        d[(long)2 * k * stride] = (int16_t)ev_at(s, stride, k, nev, nod);
-    if (k < nod) {
-        int a = ev_at(s, stride, mir(k, nev), nev, nod);
-        int b = ev_at(s, stride, mir(k + 1, nev), nev, nod);
-        d[(long)(2 * k + 1) * stride] = (int16_t)(s[(long)(nev + k) * stride] + ((a + b) >> 1));
+    if (wav) {
+        if (k < nod) {
+            int dd = s[(long)(nev + k) * stride];
+            int ev = s[(long)k * stride] - (dd >> 1);
+            d[(long)2 * k * stride] = (int16_t)ev;
+            d[(long)(2 * k + 1) * stride] = (int16_t)(dd + ev);
+        } else if (k < nev) {
+            d[(long)2 * k * stride] = s[(long)k * stride];
+        }
+    } else {
+        if (k < nev)
+            d[(long)2 * k * stride] = (int16_t)ev_at(s, stride, k, nev, nod);
+        if (k < nod) {
+            int a = ev_at(s, stride, mir(k, nev), nev, nod);
+            int b = ev_at(s, stride, mir(k + 1, nev), nev, nod);
+            d[(long)(2 * k + 1) * stride] = (int16_t)(s[(long)(nev + k) * stride] + ((a + b) >> 1));
+        }
     }
 }
 

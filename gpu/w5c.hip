@@ -95,6 +95,8 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
     if (const char *e = getenv("W5C_QP")) qp = atoi(e);
     int slice_h = 0;
     if (const char *e = getenv("W5C_SLICE")) slice_h = atoi(e);
+    int wav = 0;
+    if (const char *e = getenv("W5C_WAV")) wav = (e[0] == 'h' || e[0] == 'H') ? 1 : atoi(e);
 
     /* W5C_REPEAT repeats the whole encode in-process. A single run pays ~2 ms of cold start
        (first kernel of each type), which is meaningless for a codec that runs per frame. */
@@ -109,7 +111,7 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
         /* the transform is in place, so each repeat starts from the pristine samples */
         if (r) for (int i = 0; i < np; i++)
             HIPCHECK(hipMemcpy(P[i].d, img[i].data(), (size_t)P[i].w * P[i].h * 2, hipMemcpyHostToDevice));
-        plane_dwt_all(P, np, levels, true, &t, slice_h);
+        plane_dwt_all(P, np, levels, true, &t, slice_h, wav);
         if (qp > 0)
             for (int i = 0; i < np; i++) {
                 subband_t sb[64];
@@ -133,7 +135,7 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
             for (size_t i = 0; i < chk.size(); i++) { s1 += chk[i]; s2 += llabs((long long)chk[i]); if (chk[i]) nz++; }
             printf("    [diag] iter %d coef sum=%lld abs=%lld nz=%ld\n", r, s1, s2, nz);
         }
-        if (!gpu_encode_frame(P, np, levels, blk, bits, &sm, slice_h)) { fprintf(stderr, "encode failed\n"); return 1; }
+        if (!gpu_encode_frame(P, np, levels, blk, bits, &sm, slice_h, wav)) { fprintf(stderr, "encode failed\n"); return 1; }
         if (!write_file(outp, bits.data(), bits.size())) return 1;
         double tot = t + sm.sym + sm.pack + sm.hist + sm.enc;
         if (r == 0 || tot < best) { best = tot; best_sm = sm; ms_fwd = t; }
@@ -142,8 +144,8 @@ static int run_enc(const char *inp, const char *outp, int w, int h, int levels, 
 
     double px = (double)w * h * (yuv422 ? 2.0 : 1.0);   /* 4:2:2 = 2 samples per pixel */
     double tot = rep > 1 ? best : ms_fwd + sm.sym + sm.pack + sm.hist + sm.enc;
-    printf("%s: %dx%d%s levels=%d blk=%d slice=%d  %zu B  %.3f bpp  %zu -> %zu bytes\n",
-           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, slice_h, bits.size(),
+    printf("%s: %dx%d%s levels=%d blk=%d slice=%d wav=%s  %zu B  %.3f bpp  %zu -> %zu bytes\n",
+           inp, w, h, yuv422 ? " 4:2:2" : "", levels, blk, slice_h, wav ? "haar" : "5/3", bits.size(),
            (double)bits.size() * 8.0 / px, raw.size(), bits.size());
     printf("  fwd %.2f ms  sym %.2f  pack %.2f  hist %.2f  enc %.2f  = %.2f ms\n",
            ms_fwd, sm.sym, sm.pack, sm.hist, sm.enc, tot);
@@ -158,8 +160,8 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     if (!read_file(inp, bits)) return 1;
 
     plane_t P[W5C_MAXPLANES] = {};
-    int np = 0, levels = 0, blk = 0, slice_h = 0;
-    if (!gpu_frame_dims(bits.data(), bits.size(), P, &np, &levels, &blk, &slice_h)) {
+    int np = 0, levels = 0, blk = 0, slice_h = 0, wav = 0;
+    if (!gpu_frame_dims(bits.data(), bits.size(), P, &np, &levels, &blk, &slice_h, &wav)) {
         fprintf(stderr, "%s: not a w5c bitstream\n", inp);
         return 1;
     }
@@ -180,7 +182,7 @@ static int run_dec(const char *inp, const char *outp, bool yuv422)
     for (int r = 0; r < rep; r++) {
         float t = 0;
         if (!gpu_decode_frame(bits.data(), bits.size(), P, np, &sm)) { fprintf(stderr, "decode failed\n"); return 1; }
-        plane_dwt_all(P, np, levels, false, &t, slice_h);
+        plane_dwt_all(P, np, levels, false, &t, slice_h, wav);
         double tot = sm.dec + sm.desym + t;
         if (r == 0 || tot < best) { best = tot; best_sm = sm; best_inv = t; }
     }
