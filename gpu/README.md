@@ -84,21 +84,33 @@ and the packer must skip the padding) or cross-plane read-modify-write. Not yet 
 Result: **END-TO-END LOSSLESS, BIT-EXACT** at 1080p synthetic, 4K synthetic, and real camera
 content (8-bit, 3.584 bpp).
 
-### Stage split — the number that decides the next move
+### The encoder pipeline is now entirely on the device
 
-| frame | fwd | symbolise (host) | rANS enc | rANS dec | inv | GPU share |
-|---|---|---|---|---|---|---|
-| 1080p real | 2.9 ms | **137 ms** | 1.6 ms | 1.5 ms | 2.3 ms | 5.7% |
-| 1080p synth | 2.7 ms | **178 ms** | 0.9 ms | 1.7 ms | 2.7 ms | 2.9% |
-| 4K synth | 4.1 ms | **760 ms** | 2.9 ms | 3.3 ms | 0.6 ms | 1.4% |
+Transform, symbolisation, symbol packing, histogram, table normalisation and rANS encode all
+run on the GPU. The host only orchestrates and copies buffers.
 
-Every GPU stage together is 6–11 ms. The host symbolisation is **94–98% of the pipeline**.
-The GPU is no longer the constraint anywhere — the last host-side stage is the whole problem,
-and that is precisely the case for writing the symbolisation kernel.
+| frame | fwd | sym | emit+pack | hist+norm | enc | dec | inv | total | fps |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p synthetic | 4.4 | 8.0 | 19.6 | 1.4 | 1.4 | 1.4 | 1.0 | **37.1 ms** | 26.9 |
+| 1080p real | 2.3 | 12.9 | 22.0 | 2.0 | 1.6 | 1.5 | 2.6 | **44.9 ms** | 22.3 |
+| 4K synthetic | 4.6 | 16.6 | 27.3 | 3.2 | 2.7 | 2.9 | 3.6 | **60.9 ms** | 16.4 |
 
-(The driver also runs a reference decode for validation, ~90 ms at 1080p / ~370 ms at 4K. That
-is a test harness stage, not a codec cost, and it is excluded from the GPU share above. A real
-decoder needs a GPU desymboliser, which is the mirror of the missing symbolisation kernel.)
+All three: END-TO-END LOSSLESS, BIT-EXACT, with GPU-derived tables producing a bitstream
+byte-identical to the reference (tables verified identical first, then the bitstream).
+
+That is 7.5× faster than the previous mixed pipeline at 1080p and 18.8× at 4K, purely from
+removing the host symbolisation stage.
+
+**Where the remaining time goes:** symbolisation (count + emit + pack) is 73–80% of the
+pipeline. Two obvious cuts, both identified by measurement rather than guesswork:
+
+1. **The count pass is pure overhead.** It exists only to size the bit buffers before the emit
+   pass, so the walk runs twice. A fixed worst-case stride per stream removes it.
+2. **Planes are independent too**, so splitting each stream over its bitplanes multiplies the
+   work items by `mb` and shortens the serial runs — the occupancy fix measured earlier
+   (per-stream cost halved when stream count tripled).
+
+At 1080p60 we need ≤16.7 ms; 37 ms is 2.2× short, and both cuts attack exactly that.
 
 ## Entropy decode
 

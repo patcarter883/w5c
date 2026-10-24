@@ -274,4 +274,188 @@ static void build_gtabs(std::vector<gtab_t> &tabs, const std::vector<uint16_t> &
     }
 }
 
+/* ------------------------------------------------------- bitplane symbolise */
+/* One stream = one code-block for one context. Stateless: a coefficient is significant at
+   plane p iff |c| >= 2^p, and becomes significant iff |c| >> p == 1, so no per-coefficient
+   state is carried. */
+struct sdesc {
+    int x0, y0, bw, bh;
+    int mb;
+    int ctx;        /* 0 siggrp, 1 sig, 2 sign, 3 refine */
+    int tab;        /* subband*4 + ctx */
+};
+
+__device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x0, int cx, int cy)
+{
+    return plane[(size_t)(y0 + cy) * w + x0 + cx];
+}
+
+__global__ void k_sym(const int16_t * __restrict__ plane, int w,
+                      const sdesc * __restrict__ d,
+                      uint8_t * __restrict__ out,
+                      const uint32_t * __restrict__ boff,
+                      uint32_t * __restrict__ nbits,
+                      int nstreams, int emit)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nstreams) return;
+
+    sdesc sd = d[s];
+    int bw = sd.bw, bh = sd.bh, n = bw * bh, ctx = sd.ctx;
+    uint8_t *ob = emit ? out + boff[s] : nullptr;
+    uint32_t nb = 0;
+
+    for (int p = sd.mb - 1; p >= 0; p--) {
+        int gx = 0, gy = 0;
+        for (int g0 = 0; g0 < n; g0 += 32) {
+            int g1 = g0 + 32 < n ? g0 + 32 : n;
+
+            int newly = 0;
+            {
+                int cx = gx, cy = gy;
+                for (int i = g0; i < g1; i++) {
+                    int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
+                    int m = v < 0 ? -v : v;
+                    if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
+                    if (++cx == bw) { cx = 0; cy++; }
+                }
+            }
+            if (ctx == 0) {
+                if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+                nb++;
+                int cx = gx, cy = gy;
+                for (int i = g0; i < g1; i++) { if (++cx == bw) { cx = 0; cy++; } }
+                gx = cx; gy = cy;
+                continue;
+            }
+
+            int cx = gx, cy = gy;
+            for (int i = g0; i < g1; i++) {
+                int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
+                int m = v < 0 ? -v : v;
+                if (m >> (p + 1)) {
+                    if (ctx == 3) {
+                        if (emit && ((m >> p) & 1)) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+                        nb++;
+                    }
+                } else if (newly) {
+                    int bit = (m >> p) & 1;
+                    if (ctx == 1) {
+                        if (emit && bit) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+                        nb++;
+                    } else if (ctx == 2 && bit) {
+                        if (emit && v < 0) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
+                        nb++;
+                    }
+                }
+                if (++cx == bw) { cx = 0; cy++; }
+            }
+            gx = cx; gy = cy;
+        }
+    }
+    if (!emit) nbits[s] = nb;
+}
+
+/* exclusive prefix sum of ceil(nbits/8) - a few thousand entries, one thread */
+__global__ void k_offsets(const uint32_t * __restrict__ nbits, uint32_t * __restrict__ off, int n)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    uint32_t acc = 0;
+    for (int i = 0; i < n; i++) { off[i] = acc; acc += (nbits[i] + 7) / 8; }
+    off[n] = acc;
+}
+
+/* pack nbits LSB-first into SYMBITS-bit symbols, exactly as the reference does */
+__global__ void k_pack(const uint8_t * __restrict__ bits,
+                       const uint32_t * __restrict__ boff,
+                       const uint32_t * __restrict__ nbits,
+                       uint8_t * __restrict__ syms,
+                       const uint32_t * __restrict__ soff,
+                       uint32_t * __restrict__ nout,
+                       int nstreams)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nstreams) return;
+    const uint8_t *b = bits + boff[s];
+    uint8_t *o = syms + soff[s];
+    uint32_t ns = (nbits[s] + SYMBITS - 1) / SYMBITS;
+    nout[s] = ns;
+    for (uint32_t k = 0; k < ns; k++) {
+        unsigned v = 0;
+        for (int j = 0; j < SYMBITS; j++) {
+            size_t bit = (size_t)k * SYMBITS + j;
+            if (bit < nbits[s] && ((b[bit >> 3] >> (bit & 7)) & 1)) v |= 1u << j;
+        }
+        o[k] = (uint8_t)v;
+    }
+}
+
+/* per-stream symbol histogram accumulated into its (subband, context) table */
+__global__ void k_hist(const uint8_t * __restrict__ syms,
+                       const uint32_t * __restrict__ soff,
+                       const uint32_t * __restrict__ nsym,
+                       const uint16_t * __restrict__ stab,
+                       int * __restrict__ hist,
+                       int nstreams)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nstreams) return;
+    int local[NSYM];
+    for (int k = 0; k < NSYM; k++) local[k] = 0;
+    const uint8_t *p = syms + soff[s];
+    uint32_t n = nsym[s];
+    for (uint32_t i = 0; i < n; i++) local[p[i]]++;
+    int *h = hist + (size_t)stab[s] * NSYM;
+    for (int k = 0; k < NSYM; k++) if (local[k]) atomicAdd(h + k, local[k]);
+}
+
+/* pooled histogram per context, so cells too sparse to model can fall back */
+__global__ void k_pool(const int * __restrict__ hist, int * __restrict__ pooled,
+                       int nsets, int nctx)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nctx) return;
+    int *po = pooled + (size_t)c * NSYM;
+    for (int k = 0; k < NSYM; k++) po[k] = 0;
+    for (int t = c; t < nsets; t += nctx) {
+        const int *h = hist + (size_t)t * NSYM;
+        for (int k = 0; k < NSYM; k++) po[k] += h[k];
+    }
+}
+
+/* normalise each table exactly as rtab_build does, then emit freq[]. Cells below the
+   symbol threshold use the pooled table for their context, matching the reference. */
+__global__ void k_norm(const int * __restrict__ hist, const int * __restrict__ pooled,
+                       uint16_t * __restrict__ freq, int nsets, int nctx, int min_syms)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nsets) return;
+    const int *h = hist + (size_t)t * NSYM;
+    uint64_t celltot = 0;
+    for (int k = 0; k < NSYM; k++) celltot += (uint64_t)h[k];
+    if (celltot < (uint64_t)min_syms) h = pooled + (size_t)(t % nctx) * NSYM;
+    uint16_t *out = freq + (size_t)t * NSYM;
+
+    uint64_t tot = 0;
+    int present = 0;
+    for (int i = 0; i < NSYM; i++) { tot += (uint64_t)h[i]; if (h[i]) present++; }
+    uint32_t f[NSYM];
+    for (int i = 0; i < NSYM; i++) f[i] = 0;
+    if (tot == 0) {
+        for (int i = 0; i < NSYM; i++) out[i] = 0;
+        out[0] = RSZ;
+        return;
+    }
+    uint64_t room = (uint64_t)RSZ - (uint64_t)present;
+    for (int i = 0; i < NSYM; i++)
+        if (h[i]) f[i] = (uint32_t)(((uint64_t)h[i] * room) / tot) + 1;
+
+    uint64_t sum = 0;
+    for (int i = 0; i < NSYM; i++) sum += f[i];
+    int i = 0;
+    while (sum > RSZ) { if (f[i] > 1) { f[i]--; sum--; } i = (i + 1) % NSYM; }
+    while (sum < RSZ) { if (f[i])    { f[i]++; sum++; } i = (i + 1) % NSYM; }
+    for (int k = 0; k < NSYM; k++) out[k] = (uint16_t)f[k];
+}
+
 #endif

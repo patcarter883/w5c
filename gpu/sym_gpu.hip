@@ -19,97 +19,6 @@ extern "C" {
 #include "wavelet.h"
 }
 
-/* one stream = one code-block for one context */
-struct sdesc {
-    int x0, y0, bw, bh;     /* block origin and size in the coefficient plane */
-    int mb;                 /* block bitplane count (highest set bit of max |c|) */
-    int ctx;                /* 0 siggrp, 1 sig, 2 sign, 3 refine */
-    int tab;                /* table index, subband*4 + ctx */
-};
-
-__device__ __forceinline__ int blk_at(const int16_t *plane, int w, int y0, int x0, int cx, int cy)
-{
-    return plane[(size_t)(y0 + cy) * w + x0 + cx];
-}
-
-/* Emit (out != nullptr) or count (out == nullptr) one context's bits. */
-__global__ void k_sym(const int16_t * __restrict__ plane, int w,
-                      const sdesc * __restrict__ d,
-                      uint8_t * __restrict__ out,      /* packed bit buffer */
-                      const uint32_t * __restrict__ boff, /* per-stream byte base */
-                      uint32_t * __restrict__ nbits,   /* per-stream bit count */
-                      int nstreams, int emit)
-{
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nstreams) return;
-
-    sdesc sd = d[s];
-    int bw = sd.bw, bh = sd.bh, n = bw * bh, ctx = sd.ctx;
-    uint8_t *ob = emit ? out + boff[s] : nullptr;
-    uint32_t nb = 0;
-
-    for (int p = sd.mb - 1; p >= 0; p--) {
-        int gx = 0, gy = 0;                     /* cursor at the current group start */
-        for (int g0 = 0; g0 < n; g0 += 32) {
-            int g1 = g0 + 32 < n ? g0 + 32 : n;
-
-            int newly = 0;
-            {
-                int cx = gx, cy = gy;
-                for (int i = g0; i < g1; i++) {
-                    int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
-                    int m = v < 0 ? -v : v;
-                    if (!(m >> (p + 1)) && ((m >> p) & 1)) { newly = 1; break; }
-                    if (++cx == bw) { cx = 0; cy++; }
-                }
-            }
-            if (ctx == 0) {
-                if (emit && newly) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                nb++;
-                int cx = gx, cy = gy;
-                for (int i = g0; i < g1; i++) {
-                    if (++cx == bw) { cx = 0; cy++; }
-                }
-                gx = cx; gy = cy;
-                continue;
-            }
-
-            int cx = gx, cy = gy;
-            for (int i = g0; i < g1; i++) {
-                int v = blk_at(plane, w, sd.y0, sd.x0, cx, cy);
-                int m = v < 0 ? -v : v;
-                if (m >> (p + 1)) {                       /* already significant */
-                    if (ctx == 3) {
-                        if (emit && ((m >> p) & 1)) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    }
-                } else if (newly) {
-                    int bit = (m >> p) & 1;
-                    if (ctx == 1) {
-                        if (emit && bit) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    } else if (ctx == 2 && bit) {
-                        if (emit && v < 0) ob[nb >> 3] |= (uint8_t)(1u << (nb & 7));
-                        nb++;
-                    }
-                }
-                if (++cx == bw) { cx = 0; cy++; }
-            }
-            gx = cx; gy = cy;
-        }
-    }
-    if (!emit) nbits[s] = nb;
-}
-
-/* exclusive prefix sum of ceil(nbits/8); one thread, a few thousand entries */
-__global__ void k_offsets(const uint32_t * __restrict__ nbits, uint32_t * __restrict__ off, int n)
-{
-    if (blockIdx.x || threadIdx.x) return;
-    uint32_t acc = 0;
-    for (int i = 0; i < n; i++) { off[i] = acc; acc += (nbits[i] + 7) / 8; }
-    off[n] = acc;
-}
-
 static void gen(int16_t *p, int w, int h, int bits, int kind)
 {
     uint32_t s = 0x9e3779b9u;
@@ -258,32 +167,34 @@ int main(int argc, char **argv)
     printf("GPU symbolise: count %.2f ms + emit %.2f ms = %.2f ms\n",
            ms_count, ms_emit, ms_count + ms_emit);
 
-    /* ---- compare: pack GPU bits into 6-bit symbols the same way the reference does ---- */
+    /* ---- pack on GPU and compare against the reference symbols ---- */
+    std::vector<uint32_t> gsoff(ns + 1), gns(ns);
+    { uint64_t acc = 0;
+      for (uint32_t i = 0; i < ns; i++) { gns[i] = (nb[i] + SYMBITS - 1) / SYMBITS; gsoff[i] = (uint32_t)acc; acc += gns[i]; }
+      gsoff[ns] = (uint32_t)acc; }
+    uint8_t *d_gsym; uint32_t *d_gso, *d_gns;
+    HIPCHECK(hipMalloc(&d_gsym, gsoff[ns] ? gsoff[ns] : 1));
+    HIPCHECK(hipMalloc(&d_gso, ns * 4)); HIPCHECK(hipMalloc(&d_gns, ns * 4));
+    HIPCHECK(hipMemcpy(d_gso, gsoff.data(), ns * 4, hipMemcpyHostToDevice));
+    HIPCHECK(hipEventRecord(e0));
+    k_pack<<<nbk, 128>>>(d_bits, d_off, d_nb, d_gsym, d_gso, d_gns, (int)ns);
+    HIPCHECK(hipEventRecord(e1));
+    HIPCHECK(hipGetLastError());
+    HIPCHECK(hipDeviceSynchronize());
+    float ms_pack = 0; HIPCHECK(hipEventElapsedTime(&ms_pack, e0, e1));
+
+    std::vector<uint8_t> gsyms(gsoff[ns]);
+    HIPCHECK(hipMemcpy(gsyms.data(), d_gsym, gsoff[ns], hipMemcpyDeviceToHost));
+    printf("GPU pack: %.2f ms -> %u symbols\n", ms_pack, gsoff[ns]);
+
     size_t bad = 0, badbits = 0;
     uint32_t firstbad = 0;
     for (uint32_t i = 0; i < ns; i++) {
-        /* the reference dump stores the 6-bit symbol count, not the bit count */
-        size_t ns_sym = ((size_t)nb[i] + SYMBITS - 1) / SYMBITS;
-        if (ns_sym != rslen[i]) { if (!bad) firstbad = i; bad++; badbits += rslen[i]; continue; }
-        bool diff = false;
-        for (size_t k = 0; k < ns_sym && !diff; k++) {
-            unsigned v = 0;
-            for (int j = 0; j < SYMBITS; j++) {
-                size_t b = k * SYMBITS + (size_t)j;
-                if (b < nb[i]) {
-                    uint8_t byte = bits[off[i] + (b >> 3)];
-                    if ((byte >> (b & 7)) & 1) v |= 1u << j;
-                }
-            }
-            if (v != rsyms[rsoff[i] + k]) diff = true;
+        if (gns[i] != rslen[i]) { if (!bad) firstbad = i; bad++; badbits += rslen[i]; continue; }
+        if (memcmp(gsyms.data() + gsoff[i], rsyms.data() + rsoff[i], rslen[i])) {
+            if (!bad) firstbad = i; bad++; badbits += rslen[i];
         }
-        if (diff) { if (!bad) firstbad = i; bad++; badbits += rslen[i]; }
     }
-    if (bad)
-        for (uint32_t i = 0; i < 4 && i < ns; i++)
-            printf("  stream %u: x0=%d y0=%d %dx%d mb=%d ctx=%d -> gpu %u ref %u\n",
-                   i, desc[i].x0, desc[i].y0, desc[i].bw, desc[i].bh, desc[i].mb, desc[i].ctx,
-                   nb[i], rslen[i]);
     printf("validation: %s (%zu/%u streams differ)  GPU bitstream %u bytes\n",
            bad ? "MISMATCH" : "symbols identical to reference", bad, ns, totalbytes);
     if (bad) {
