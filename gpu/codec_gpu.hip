@@ -189,21 +189,32 @@ int main(int argc, char **argv)
     HIPCHECK(hipMemcpy(d_desc, desc.data(), desc.size() * sizeof(sdesc), hipMemcpyHostToDevice));
 
     int nbs = (dmp.ns + 127) / 128;
+
+    /* Worst case bits for a stream is n*(mb+1); using a fixed stride removes the count pass
+       entirely, which existed only to size these buffers. */
+    uint32_t stride = 1;
+    for (uint32_t i = 0; i < dmp.ns; i++) {
+        uint32_t worst = ((uint32_t)desc[i].bw * desc[i].bh * (desc[i].mb + 1) + 7) / 8;
+        if (worst > stride) stride = worst;
+    }
+    std::vector<uint32_t> fboff(dmp.ns + 1);
+    for (uint32_t i = 0; i < dmp.ns; i++) fboff[i] = i * stride;
+    fboff[dmp.ns] = dmp.ns * stride;
+
+    uint8_t *d_bits;
+    HIPCHECK(hipMalloc(&d_bits, (size_t)dmp.ns * stride));
+    HIPCHECK(hipMemset(d_bits, 0, (size_t)dmp.ns * stride));
+    HIPCHECK(hipMemcpy(d_boff, fboff.data(), (dmp.ns + 1) * 4, hipMemcpyHostToDevice));
+
     HIPCHECK(hipDeviceSynchronize());
     HIPCHECK(hipEventRecord(ev[2]));
-    k_sym<<<nbs, 128>>>(d, w, d_desc, nullptr, nullptr, d_nb, (int)dmp.ns, 0);
-    k_offsets<<<1, 1>>>(d_nb, d_boff, (int)dmp.ns);
+    k_sym<<<nbs, 128>>>(d, w, d_desc, d_bits, d_boff, d_nb, (int)dmp.ns, 1);
     HIPCHECK(hipEventRecord(ev[3]));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());
-    float ms_symgpu = 0; HIPCHECK(hipEventElapsedTime(&ms_symgpu, ev[2], ev[3]));
+    float ms_symemit = 0; HIPCHECK(hipEventElapsedTime(&ms_symemit, ev[2], ev[3]));
+    float ms_symgpu = 0;
 
-    uint32_t nbitbytes = 0;
-    HIPCHECK(hipMemcpy(&nbitbytes, d_boff + dmp.ns, 4, hipMemcpyDeviceToHost));
-    uint8_t *d_bits; HIPCHECK(hipMalloc(&d_bits, nbitbytes ? nbitbytes : 1));
-    HIPCHECK(hipMemset(d_bits, 0, nbitbytes));
-
-    /* per-stream symbol offsets + totals, from the bit counts */
     std::vector<uint32_t> gnb(dmp.ns), gsyms_off(dmp.ns + 1), gsym_n(dmp.ns);
     HIPCHECK(hipMemcpy(gnb.data(), d_nb, dmp.ns * 4, hipMemcpyDeviceToHost));
     { uint64_t acc = 0;
@@ -217,14 +228,13 @@ int main(int argc, char **argv)
     HIPCHECK(hipMemcpy(d_gso, gsyms_off.data(), dmp.ns * 4, hipMemcpyHostToDevice));
 
     HIPCHECK(hipEventRecord(ev[2]));
-    k_sym<<<nbs, 128>>>(d, w, d_desc, d_bits, d_boff, d_nb, (int)dmp.ns, 1);
     k_pack<<<nbs, 128>>>(d_bits, d_boff, d_nb, d_gsym, d_gso, d_gns, (int)dmp.ns);
     HIPCHECK(hipEventRecord(ev[3]));
     HIPCHECK(hipGetLastError());
     HIPCHECK(hipDeviceSynchronize());
-    float ms_symemit = 0; HIPCHECK(hipEventElapsedTime(&ms_symemit, ev[2], ev[3]));
+    float ms_pack = 0; HIPCHECK(hipEventElapsedTime(&ms_pack, ev[2], ev[3]));
 
-    /* histogram + normalise on device, exactly as the reference table builder does */
+    /* histogram + normalise on device    /* histogram + normalise on device, exactly as the reference table builder does */
     int ntab = dmp.nsb * dmp.nctx;
     uint16_t *d_stab2; HIPCHECK(hipMalloc(&d_stab2, dmp.ns * 2));
     HIPCHECK(hipMemcpy(d_stab2, dmp.stab.data(), dmp.ns * 2, hipMemcpyHostToDevice));
@@ -245,8 +255,8 @@ int main(int argc, char **argv)
     std::vector<uint16_t> gfreqs((size_t)ntab * NSYM);
     HIPCHECK(hipMemcpy(gfreqs.data(), d_freq, gfreqs.size() * 2, hipMemcpyDeviceToHost));
     int tab_diff = memcmp(gfreqs.data(), dmp.freqs.data(), gfreqs.size() * 2) ? 1 : 0;
-    printf("2b. GPU symbolise      %7.2f + %.2f ms   pack+hist %5.2f ms   tables %s\n",
-           ms_symgpu, ms_symemit, ms_tables,
+    printf("2b. GPU symbolise      %7.2f ms (one walk)   pack %.2f ms   hist+norm %.2f ms   tables %s\n",
+           ms_symemit, ms_pack, ms_tables,
            tab_diff ? "*** DIFFER ***" : "identical to reference");
 
     /* ---- 3. GPU rANS encode, must reproduce the reference bitstream ---- */
@@ -357,9 +367,9 @@ int main(int argc, char **argv)
     printf("5. GPU inverse + ref dec %5.2f ms   %s\n", ms_inv,
            pix_ok ? "round-trip pixels bit-exact" : "*** PIXEL MISMATCH ***");
 
-    double gpu_ms = ms_fwd + ms_symgpu + ms_symemit + ms_tables + ms_enc + ms_dec + ms_inv;
-    printf("\nGPU pipeline: fwd %.2f | sym %.2f | emit+pack %.2f | hist+norm %.2f | enc %.2f | dec %.2f | inv %.2f  = %.2f ms\n",
-           ms_fwd, ms_symgpu, ms_symemit, ms_tables, ms_enc, ms_dec, ms_inv, gpu_ms);
+    double gpu_ms = ms_fwd + ms_symemit + ms_pack + ms_tables + ms_enc + ms_dec + ms_inv;
+    printf("\nGPU pipeline: fwd %.2f | sym+emit %.2f | pack %.2f | hist+norm %.2f | enc %.2f | dec %.2f | inv %.2f  = %.2f ms\n",
+           ms_fwd, ms_symemit, ms_pack, ms_tables, ms_enc, ms_dec, ms_inv, gpu_ms);
     printf("host oracle (validation only, not part of the pipeline): symbolise %.1f ms, reference decode %.1f ms\n",
            ms_sym, ms_rd);
     printf("bitrate %.3f bpp   equivalent %.1f fps\n",

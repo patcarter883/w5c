@@ -89,28 +89,28 @@ content (8-bit, 3.584 bpp).
 Transform, symbolisation, symbol packing, histogram, table normalisation and rANS encode all
 run on the GPU. The host only orchestrates and copies buffers.
 
-| frame | fwd | sym | emit+pack | hist+norm | enc | dec | inv | total | fps |
+| frame | fwd | sym+emit | pack | hist+norm | enc | dec | inv | total | fps |
 |---|---|---|---|---|---|---|---|---|---|
-| 1080p synthetic | 4.4 | 8.0 | 19.6 | 1.4 | 1.4 | 1.4 | 1.0 | **37.1 ms** | 26.9 |
-| 1080p real | 2.3 | 12.9 | 22.0 | 2.0 | 1.6 | 1.5 | 2.6 | **44.9 ms** | 22.3 |
-| 4K synthetic | 4.6 | 16.6 | 27.3 | 3.2 | 2.7 | 2.9 | 3.6 | **60.9 ms** | 16.4 |
+| 1080p synthetic | 4.2 | 17.4 | 2.0 | 1.9 | 1.1 | 2.5 | 2.9 | **32.1 ms** | 31.2 |
+| 1080p real | 3.6 | 19.9 | 2.2 | 2.2 | 1.5 | 1.9 | 2.9 | **34.4 ms** | 29.0 |
+| 4K synthetic | 3.8 | 25.0 | 3.1 | 3.2 | 2.8 | 3.6 | 3.5 | **45.1 ms** | 22.2 |
 
 All three: END-TO-END LOSSLESS, BIT-EXACT, with GPU-derived tables producing a bitstream
-byte-identical to the reference (tables verified identical first, then the bitstream).
+byte-identical to the reference (tables verified identical, then the bitstream).
 
-That is 7.5× faster than the previous mixed pipeline at 1080p and 18.8× at 4K, purely from
-removing the host symbolisation stage.
+That is 8.7× faster than the mixed pipeline at 1080p and 25× at 4K. Two changes got there:
 
-**Where the remaining time goes:** symbolisation (count + emit + pack) is 73–80% of the
-pipeline. Two obvious cuts, both identified by measurement rather than guesswork:
+1. **Moving symbolisation to the device** — it was 94–98% of the pipeline, so this was the
+   whole game (279 ms → 37 ms at 1080p).
+2. **Deleting the count pass** — it existed only to size buffers before the emit pass, so the
+   walk ran twice. A fixed worst-case byte stride per stream means one walk (37 → 32 ms,
+   61 → 45 ms). The bits land at stride boundaries, which the packer already handles.
 
-1. **The count pass is pure overhead.** It exists only to size the bit buffers before the emit
-   pass, so the walk runs twice. A fixed worst-case stride per stream removes it.
-2. **Planes are independent too**, so splitting each stream over its bitplanes multiplies the
-   work items by `mb` and shortens the serial runs — the occupancy fix measured earlier
-   (per-stream cost halved when stream count tripled).
-
-At 1080p60 we need ≤16.7 ms; 37 ms is 2.2× short, and both cuts attack exactly that.
+**Where the remaining time goes:** sym+emit is 54–72% of the pipeline and it is still one
+thread per (block, context) — 2308 work-items at 1080p on 8192 lanes, one wave deep. Planes
+are independent too (only the output bit offset links them), so splitting each stream over its
+bitplanes would multiply the work items by `mb` and shorten the serial runs. That is the
+measured occupancy fix; at 1080p60 the target is ≤16.7 ms and 32 ms is ~1.9× short.
 
 ## Entropy decode
 

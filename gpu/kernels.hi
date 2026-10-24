@@ -353,7 +353,7 @@ __global__ void k_sym(const int16_t * __restrict__ plane, int w,
             gx = cx; gy = cy;
         }
     }
-    if (!emit) nbits[s] = nb;
+    nbits[s] = nb;   /* always: the emit pass is the only walk */
 }
 
 /* exclusive prefix sum of ceil(nbits/8) - a few thousand entries, one thread */
